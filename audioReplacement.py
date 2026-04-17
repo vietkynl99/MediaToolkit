@@ -30,7 +30,13 @@ def browse_output_folder():
 
 def get_duration(file):
     cmd = ["ffmpeg", "-i", file]
-    result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True)
+    result = subprocess.run(
+        cmd,
+        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        encoding="utf-8",
+        errors="ignore"
+    )
     match = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", result.stderr)
     if match:
         h, m, s = match.groups()
