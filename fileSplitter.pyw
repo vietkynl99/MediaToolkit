@@ -32,8 +32,9 @@ def browse_file():
     global selected_files
     files = filedialog.askopenfilenames(
         filetypes=[
-            ("Compressed files", "*.zip *.rar"),
             ("All files", "*.*"),
+            ("Compressed files", "*.zip *.rar"),
+            ("Text files", "*.txt *.csv *.log *.md"),
         ]
     )
     if files:
@@ -294,3 +295,4 @@ progress_label = tk.Label(root, text="0%")
 progress_label.pack()
 
 root.mainloop()
+
