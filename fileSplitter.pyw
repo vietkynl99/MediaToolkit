@@ -79,12 +79,43 @@ def collect_files_from_dir(folder_path):
     return files
 
 
-def extract_archive(archive_path, extract_to):
+def get_archive_uncompressed_size(archive_path):
+    ext = os.path.splitext(archive_path)[1].lower()
+    total_size = 0
+
+    if ext == ".zip":
+        with zipfile.ZipFile(archive_path, "r") as zip_ref:
+            for info in zip_ref.infolist():
+                if not info.is_dir():
+                    total_size += info.file_size
+        return total_size
+
+    if ext == ".rar":
+        try:
+            import rarfile
+        except ImportError:
+            raise RuntimeError(
+                "Cannot extract .rar. Install with: pip install rarfile, "
+                "and make sure unrar/winrar is available on your machine."
+            )
+
+        with rarfile.RarFile(archive_path, "r") as rar_ref:
+            for info in rar_ref.infolist():
+                if not info.isdir():
+                    total_size += info.file_size
+        return total_size
+
+    raise RuntimeError(f"Unsupported archive format: {archive_path}")
+
+def extract_archive(archive_path, extract_to, on_member_extracted=None):
     ext = os.path.splitext(archive_path)[1].lower()
 
     if ext == ".zip":
         with zipfile.ZipFile(archive_path, "r") as zip_ref:
-            zip_ref.extractall(extract_to)
+            for info in zip_ref.infolist():
+                zip_ref.extract(info, extract_to)
+                if on_member_extracted is not None and not info.is_dir():
+                    on_member_extracted(info.file_size)
         return
 
     if ext == ".rar":
@@ -97,7 +128,10 @@ def extract_archive(archive_path, extract_to):
             )
 
         with rarfile.RarFile(archive_path, "r") as rar_ref:
-            rar_ref.extractall(extract_to)
+            for info in rar_ref.infolist():
+                rar_ref.extract(info, extract_to)
+                if on_member_extracted is not None and not info.isdir():
+                    on_member_extracted(info.file_size)
         return
 
     raise RuntimeError(f"Unsupported archive format: {archive_path}")
@@ -144,6 +178,28 @@ def split_file_worker(selected_files_input, size_mb, delete_original):
     files_to_split = []
     archive_expected_splits = {}
     archive_success_splits = {}
+    total_extract_bytes = 0
+    processed_extract_bytes = 0
+    total_split_bytes = 0
+    processed_split_bytes = 0
+
+    for file_path in selected_files_input:
+        if not os.path.exists(file_path) or not is_archive(file_path):
+            continue
+        try:
+            total_extract_bytes += get_archive_uncompressed_size(file_path)
+        except Exception:
+            pass
+
+    def update_combined_progress():
+        total_work = total_extract_bytes + total_split_bytes
+        done_work = processed_extract_bytes + processed_split_bytes
+        if total_work <= 0:
+            return
+        percent = (done_work / total_work) * 100
+        if percent > 100:
+            percent = 100
+        ui_set_progress(percent, f"{percent:.2f}%")
 
     try:
         for file_path in selected_files_input:
@@ -160,7 +216,12 @@ def split_file_worker(selected_files_input, size_mb, delete_original):
                 )
 
                 try:
-                    extract_archive(file_path, temp_dir)
+                    def on_member_extracted(size):
+                        nonlocal processed_extract_bytes
+                        processed_extract_bytes += size
+                        update_combined_progress()
+
+                    extract_archive(file_path, temp_dir, on_member_extracted)
                     extracted_files = collect_files_from_dir(temp_dir)
                     if not extracted_files:
                         results.append(f"Warning {os.path.basename(file_path)}: archive is empty")
@@ -196,24 +257,17 @@ def split_file_worker(selected_files_input, size_mb, delete_original):
             ui_show_error("Error", "No valid files to split.")
             return
 
-        total_bytes = sum(
+        total_split_bytes = sum(
             os.path.getsize(file_info["path"])
             for file_info in files_to_split
             if os.path.isfile(file_info["path"])
         )
-        processed_bytes = 0
+        update_combined_progress()
 
         def on_chunk_written(chunk_size):
-            nonlocal processed_bytes
-            processed_bytes += chunk_size
-            if total_bytes > 0:
-                percent = (processed_bytes / total_bytes) * 100
-                if percent > 100:
-                    percent = 100
-                ui_set_progress(
-                    percent,
-                    f"{percent:.2f}% ({processed_bytes}/{total_bytes} bytes)",
-                )
+            nonlocal processed_split_bytes
+            processed_split_bytes += chunk_size
+            update_combined_progress()
 
         for idx, file_info in enumerate(files_to_split, start=1):
             result = split_one_file(
@@ -227,7 +281,7 @@ def split_file_worker(selected_files_input, size_mb, delete_original):
             if file_info["source_archive"] and result.startswith("OK "):
                 archive_success_splits[file_info["source_archive"]] += 1
 
-            if total_bytes == 0:
+            if total_split_bytes == 0:
                 percent = (idx / total_files) * 100
                 ui_set_progress(percent, f"{percent:.2f}% ({idx}/{total_files} files)")
 
