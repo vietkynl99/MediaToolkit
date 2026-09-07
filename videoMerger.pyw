@@ -71,6 +71,7 @@ def probe_stream_key(path):
         audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
 
         video_key = None
+        is_vfr = False
         if video:
             video_key = (
                 video.get("codec_name"),
@@ -79,6 +80,7 @@ def probe_stream_key(path):
                 video.get("r_frame_rate"),
                 video.get("pix_fmt"),
             )
+            is_vfr = _is_variable_frame_rate(video.get("r_frame_rate"), video.get("avg_frame_rate"))
 
         audio_key = None
         if audio:
@@ -88,16 +90,38 @@ def probe_stream_key(path):
                 audio.get("channels"),
             )
 
-        return (video_key, audio_key)
+        return (video_key, audio_key, is_vfr)
     except Exception:
         return None
+
+
+def _is_variable_frame_rate(r_frame_rate, avg_frame_rate):
+    def to_float(rate):
+        try:
+            num, den = rate.split("/")
+            den = float(den)
+            return float(num) / den if den else None
+        except Exception:
+            return None
+
+    r = to_float(r_frame_rate)
+    avg = to_float(avg_frame_rate)
+    if r is None or avg is None or r == 0:
+        return False
+    # nominal r_frame_rate vs measured avg_frame_rate diverging means frames
+    # aren't evenly spaced, so concat via stream copy can produce a broken
+    # timestamp/keyframe index in the output (plays fine, then freezes on seek)
+    return abs(r - avg) / r > 0.05
 
 
 def can_use_fast_concat(files):
     keys = [probe_stream_key(f) for f in files]
     if any(k is None for k in keys):
         return False
-    return len(set(keys)) == 1
+    if any(k[2] for k in keys):
+        return False
+    stream_keys = [(k[0], k[1]) for k in keys]
+    return len(set(stream_keys)) == 1
 
 
 def log(msg):
@@ -204,7 +228,7 @@ def merge_videos():
             if fast_mode:
                 log("✔ Các video cùng codec/độ phân giải → dùng chế độ NHANH (copy, không re-encode)")
             else:
-                log("⚠ Các video khác codec/độ phân giải/định dạng → tự động chuyển sang RE-ENCODE")
+                log("⚠ Các video khác codec/độ phân giải/định dạng, hoặc có video VFR (frame rate không đều) → tự động chuyển sang RE-ENCODE")
 
             if fast_mode:
                 # ffmpeg concat demuxer format: file '<path>' per line, single quotes escaped
