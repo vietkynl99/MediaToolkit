@@ -79,6 +79,10 @@ def probe_stream_key(path):
                 video.get("height"),
                 video.get("r_frame_rate"),
                 video.get("pix_fmt"),
+                # differing time_base between segments makes the concat
+                # demuxer rescale PTS/DTS incorrectly in "-c copy" mode,
+                # corrupting duration metadata and freezing playback on seek
+                video.get("time_base"),
             )
             is_vfr = _is_variable_frame_rate(video.get("r_frame_rate"), video.get("avg_frame_rate"))
 
