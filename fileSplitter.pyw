@@ -10,6 +10,7 @@ from tkinter import ttk
 DEFAULT_SIZE_MB = 10
 
 selected_files = []
+selected_folders = []
 
 
 def ui_set_progress(percent, text):
@@ -38,14 +39,41 @@ def browse_file():
         ]
     )
     if files:
-        selected_files = list(files)
-        entry_file.delete(0, tk.END)
-        entry_file.insert(0, f"Selected {len(selected_files)} file(s)")
+        for f in files:
+            if f not in selected_files:
+                selected_files.append(f)
+        update_selected_files_label()
+
+
+def browse_folder():
+    global selected_folders
+    folder = filedialog.askdirectory()
+    if folder and folder not in selected_folders:
+        selected_folders.append(folder)
+        update_selected_files_label()
+
+
+def update_selected_files_label():
+    files_listbox.delete(0, tk.END)
+    for folder in selected_folders:
+        files_listbox.insert(tk.END, f"[Folder] {folder}")
+    for f in selected_files:
+        files_listbox.insert(tk.END, f)
+    files_count_label.config(
+        text=f"Selected {len(selected_folders)} folder(s), {len(selected_files)} file(s)"
+    )
+
+
+def clear_selected_files():
+    global selected_files, selected_folders
+    selected_files = []
+    selected_folders = []
+    update_selected_files_label()
 
 
 def split_file():
-    if not selected_files:
-        messagebox.showerror("Error", "Please select at least one file.")
+    if not selected_files and not selected_folders:
+        messagebox.showerror("Error", "Please select at least one file or folder.")
         return
 
     size_text = entry_size.get().strip()
@@ -57,7 +85,16 @@ def split_file():
         messagebox.showerror("Error", "Part size must be a number.")
         return
 
-    files_snapshot = list(selected_files)
+    files_snapshot = []
+    seen_paths = set()
+    for f in selected_files + [
+        f for folder in selected_folders for f in collect_files_from_dir(folder)
+    ]:
+        key = os.path.normcase(os.path.abspath(f))
+        if key not in seen_paths:
+            seen_paths.add(key)
+            files_snapshot.append(f)
+
     btn_split.config(state="disabled")
     threading.Thread(
         target=split_file_worker,
@@ -319,14 +356,35 @@ def split_file_worker(selected_files_input, size_mb, delete_original):
 # GUI
 root = tk.Tk()
 root.title("File Splitter")
-root.geometry("450x320")
+root.geometry("550x480")
 
 tk.Label(root, text="Select file(s):").pack(pady=5)
 
-entry_file = tk.Entry(root, width=60)
-entry_file.pack()
+files_list_frame = tk.Frame(root)
+files_list_frame.pack(fill=tk.BOTH, expand=True, padx=10)
 
-tk.Button(root, text="Browse", command=browse_file).pack(pady=5)
+files_scrollbar_y = tk.Scrollbar(files_list_frame, orient=tk.VERTICAL)
+files_scrollbar_x = tk.Scrollbar(files_list_frame, orient=tk.HORIZONTAL)
+files_listbox = tk.Listbox(
+    files_list_frame,
+    height=10,
+    yscrollcommand=files_scrollbar_y.set,
+    xscrollcommand=files_scrollbar_x.set,
+)
+files_scrollbar_y.config(command=files_listbox.yview)
+files_scrollbar_x.config(command=files_listbox.xview)
+files_scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
+files_scrollbar_x.pack(side=tk.BOTTOM, fill=tk.X)
+files_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+files_count_label = tk.Label(root, text="Selected 0 file(s)")
+files_count_label.pack()
+
+browse_buttons_frame = tk.Frame(root)
+browse_buttons_frame.pack(pady=5)
+tk.Button(browse_buttons_frame, text="Browse Files", command=browse_file).pack(side=tk.LEFT, padx=5)
+tk.Button(browse_buttons_frame, text="Browse Folder", command=browse_folder).pack(side=tk.LEFT, padx=5)
+tk.Button(browse_buttons_frame, text="Clear", command=clear_selected_files).pack(side=tk.LEFT, padx=5)
 
 tk.Label(root, text="Part size (MB):").pack(pady=5)
 
