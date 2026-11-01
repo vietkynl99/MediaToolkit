@@ -27,7 +27,6 @@ progress_queue = queue.Queue()
 result_queue = queue.Queue()
 current_process = None
 is_running = False
-results = []
 
 # ================= CORE =================
 def log(msg):
@@ -139,26 +138,15 @@ def measure_file(path, start, end, lo, hi):
     return bpm, stability_percent(flux, bpm, lo, hi)
 
 # ================= UI ACTIONS =================
-def browse_files():
-    files = filedialog.askopenfilenames(
+def browse_file():
+    path = filedialog.askopenfilename(
         filetypes=[
             ("Audio/Video files", "*.wav *.mp3 *.flac *.m4a *.aac *.ogg *.mp4 *.mkv *.avi *.mov *.webm"),
             ("All files", "*.*")
         ]
     )
-    if files:
-        file_list.delete(0, tk.END)
-        for f in files:
-            file_list.insert(tk.END, f)
-
-def refresh_table(*_):
-    tree.delete(*tree.get_children())
-    for r in results:
-        tree.insert("", tk.END, values=(
-            r["name"],
-            "%.2f" % r["bpm"],
-            "%.0f%%" % r["conf"]
-        ))
+    if path:
+        file_var.set(path)
 
 def process_queues():
     while not log_queue.empty():
@@ -166,17 +154,13 @@ def process_queues():
         log_text.see(tk.END)
     while not progress_queue.empty():
         progress_var.set(progress_queue.get())
-    refreshed = False
     while not result_queue.empty():
         kind, payload = result_queue.get()
         if kind == "result":
-            results.append(payload)
-            refreshed = True
+            result_var.set("%.2f BPM  (tin cậy %.0f%%)" % (payload["bpm"], payload["conf"]))
         elif kind == "done":
             start_btn.config(state=tk.NORMAL)
             stop_btn.config(state=tk.DISABLED)
-    if refreshed:
-        refresh_table()
     root.after(100, process_queues)
 
 def start_measure():
@@ -185,8 +169,8 @@ def start_measure():
     if is_running:
         return
 
-    files = file_list.get(0, tk.END)
-    if not files:
+    path = file_var.get()
+    if not path:
         messagebox.showerror("Error", "Chưa chọn file")
         return
 
@@ -206,8 +190,7 @@ def start_measure():
         messagebox.showerror("Error", "BPM min phải nhỏ hơn BPM max")
         return
 
-    results.clear()
-    refresh_table()
+    result_var.set("")
     progress_var.set(0)
 
     is_running = True
@@ -217,27 +200,21 @@ def start_measure():
     def run():
         global is_running
 
-        total = len(files)
+        name = os.path.basename(path)
+        log(f"\n--- Đang đo: {name} ---")
 
-        for i, path in enumerate(files):
-            if not is_running:
-                break
+        try:
+            res = measure_file(path, start, end, lo, hi)
+            if res:
+                bpm, conf = res
+                log(f"✔ {name}: {bpm:.2f} BPM (tin cậy {conf:.0f}%)")
+                result_queue.put(("result", {"name": name, "bpm": bpm, "conf": conf}))
+            elif is_running:
+                log(f"✖ Failed: {name}")
+        except Exception as e:
+            log(f"Error: {str(e)}")
 
-            name = os.path.basename(path)
-            log(f"\n--- Đang đo: {name} ---")
-
-            try:
-                res = measure_file(path, start, end, lo, hi)
-                if res:
-                    bpm, conf = res
-                    log(f"✔ {name}: {bpm:.2f} BPM (tin cậy {conf:.0f}%)")
-                    result_queue.put(("result", {"name": name, "bpm": bpm, "conf": conf}))
-                elif is_running:
-                    log(f"✖ Failed: {name}")
-            except Exception as e:
-                log(f"Error: {str(e)}")
-
-            progress_queue.put((i + 1) / total * 100)
+        progress_queue.put(100)
 
         if not is_running:
             log("⚠ Stopped")
@@ -273,12 +250,13 @@ if np is None:
 frame = ttk.Frame(root, padding=10)
 frame.pack(fill=tk.BOTH, expand=True)
 
-# File list
-ttk.Label(frame, text="Danh sách file audio/video:").pack(anchor="w")
-file_list = tk.Listbox(frame, height=5)
-file_list.pack(fill=tk.BOTH, expand=True, pady=5)
-
-ttk.Button(frame, text="Chọn file", command=browse_files).pack(pady=5)
+# File select
+ttk.Label(frame, text="File audio/video:").pack(anchor="w")
+file_var = tk.StringVar()
+file_frame = ttk.Frame(frame)
+file_frame.pack(fill=tk.X, pady=5)
+ttk.Entry(file_frame, textvariable=file_var, state="readonly").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+ttk.Button(file_frame, text="Chọn file", command=browse_file).pack(side=tk.LEFT)
 
 # Options
 opt_frame = ttk.Frame(frame)
@@ -301,19 +279,12 @@ ttk.Label(opt_frame, text="BPM max:").grid(row=1, column=2, sticky="w", padx=5)
 ttk.Spinbox(opt_frame, from_=40, to=250, textvariable=max_var, width=8).grid(row=1, column=3, padx=5)
 ttk.Label(opt_frame, text="(dải chọn nhịp chính, tránh nhầm gấp đôi/một nửa)").grid(row=1, column=4, sticky="w", padx=5)
 
-# Result table
-ttk.Label(frame, text="Kết quả:").pack(anchor="w")
-
-columns = ("file", "bpm", "conf")
-tree = ttk.Treeview(frame, columns=columns, show="headings", height=6)
-for col, text, width in (
-    ("file", "File", 500),
-    ("bpm", "BPM", 150),
-    ("conf", "Tin cậy (%)", 150),
-):
-    tree.heading(col, text=text)
-    tree.column(col, width=width, anchor="w" if col == "file" else "center")
-tree.pack(fill=tk.BOTH, expand=True, pady=5)
+# Result
+result_var = tk.StringVar()
+result_frame = ttk.Frame(frame)
+result_frame.pack(fill=tk.X, pady=5)
+ttk.Label(result_frame, text="Kết quả:").pack(side=tk.LEFT)
+ttk.Label(result_frame, textvariable=result_var, font=("Segoe UI", 16, "bold")).pack(side=tk.LEFT, padx=10)
 
 # Progress
 progress_var = tk.DoubleVar()
