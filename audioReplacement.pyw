@@ -6,6 +6,7 @@ import re
 import os
 
 video_files = []
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 def browse_videos():
     paths = filedialog.askopenfilenames(
@@ -35,7 +36,8 @@ def get_duration(file):
         stderr=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         encoding="utf-8",
-        errors="ignore"
+        errors="ignore",
+        creationflags=NO_WINDOW
     )
     match = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", result.stderr)
     if match:
@@ -82,7 +84,8 @@ def run_batch():
                 stderr=subprocess.STDOUT,
                 text=True,
                 encoding="utf-8",
-                errors="ignore"
+                errors="ignore",
+                creationflags=NO_WINDOW
             )
 
             for line in process.stdout:
