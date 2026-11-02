@@ -36,7 +36,7 @@ SNAP_RATIO = 0.35       # snap onset trong +-35% độ dài âm tiết trung bì
 SHORT_WORD = 0.15       # từ ngắn hơn mức này dùng \k thay vì \kf
 
 DEFAULT_LEAD_IN = 2.0   # lời hiện trước lúc hát tối thiểu bao lâu (giây)
-COUNTDOWN_BEATS = 4     # số chấm đếm ngược trước câu đầu bài (chỉ hiện một lần)
+COUNTDOWN_BEATS = 4     # số chấm đếm ngược trước câu đầu bài và câu đầu tiên sau mỗi khoảng nghỉ dài
 VERSE_READ_TIME = 1.5   # thời gian đọc/lấy hơi cộng thêm vào phần đếm ngược khi tự tính
 VERSE_LEAD_RANGE = (3.0, 8.0)  # chặn hiện trước đầu đoạn khi tự tính (giây)
 COUNTDOWN_HOLD = 0.25   # chấm cuối còn sáng thêm sau khi bắt đầu hát (giây)
@@ -480,7 +480,8 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
             ass_time(show), ass_time(hide), style, body))
         say("  [%s] %.1f âm tiết/s (%s) %s" % (ass_time(start), rate, speed, text))
 
-        if countdown and i == 0:    # chỉ đếm ngược ở câu đầu bài, sau khoảng nghỉ không hiện lại
+        is_verse_start = i == 0 or groups[i] != groups[i - 1]   # đầu bài hoặc sau khoảng nghỉ dài
+        if countdown and is_verse_start:
             last = start    # chấm cuối sáng đúng lúc bắt đầu hát, hoặc phách gần nhất nếu dò được
             if phase_at:
                 phase = phase_at(start)
@@ -494,7 +495,7 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
                     ass_time(t0), ass_time(t_end),
                     "{\\fad(150,150)}" + countdown_text(t0, lit, t_end, dot_outline_tags)))
             else:
-                say("  ⚠ Câu đầu bài hiện trước quá ngắn, bỏ qua đếm ngược")
+                say("  ⚠ Đầu đoạn %s hiện trước quá ngắn, bỏ qua đếm ngược" % ass_time(start))
 
     return header + "\n".join(events) + "\n"
 
@@ -940,7 +941,7 @@ if __name__ == "__main__":
         row=5, column=3, padx=5)
 
     countdown_var = tk.BooleanVar(value=True)
-    ttk.Checkbutton(opt_frame, text="Đếm ngược 4 chấm theo nhịp ở đầu bài", variable=countdown_var).grid(
+    ttk.Checkbutton(opt_frame, text="Đếm ngược", variable=countdown_var).grid(
         row=6, column=0, columnspan=4, sticky="w", padx=5, pady=(5, 5))
 
     # Preview
