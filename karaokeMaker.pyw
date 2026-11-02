@@ -50,6 +50,7 @@ FAST_RATE = 5.5         # trên mức này là câu nhanh
 
 LAYOUT_CENTER = "Cả hai dòng căn giữa"
 LAYOUT_SPLIT = "Dòng 1 căn trái, dòng 2 căn phải"
+VIDEO_FPS = 25
 PREVIEW_SIZE = (640, 360)
 PREVIEW_BG = "0x202020"
 PREVIEW_DEBOUNCE_MS = 500
@@ -490,6 +491,13 @@ def browse_srt():
     if path:
         srt_var.set(path)
 
+def browse_bg():
+    path = filedialog.askopenfilename(
+        filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")]
+    )
+    if path:
+        bg_var.set(path)
+
 def browse_audio():
     path = filedialog.askopenfilename(
         filetypes=[
@@ -519,6 +527,7 @@ def process_queues():
                 start_preview()
         elif kind == "done":
             start_btn.config(state=tk.NORMAL)
+            video_btn.config(state=tk.NORMAL)
             stop_btn.config(state=tk.DISABLED)
     root.after(100, process_queues)
 
@@ -645,7 +654,66 @@ def start_preview():
               res_y * 16 // 9, res_y, style),
         daemon=True).start()
 
-def start_make():
+def audio_duration(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                        "-of", "default=nw=1:nk=1", path],
+                       capture_output=True, text=True, errors="replace",
+                       creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    try:
+        return float(r.stdout.strip())
+    except ValueError:
+        return None
+
+def render_video(ass, audio_path, bg_path, out_path, res_x, res_y):
+    """ASS + audio (+ ảnh nền) → mp4 bằng ffmpeg; tiến độ chiếm đoạn 60→100%. True nếu thành công."""
+    global current_process
+
+    work = os.path.join(tempfile.gettempdir(), "karaokeMakerVideo")
+    os.makedirs(work, exist_ok=True)
+    with open(os.path.join(work, "karaoke.ass"), "w", encoding="utf-8") as f:
+        f.write(ass)
+
+    if bg_path:
+        src = ["-loop", "1", "-framerate", str(VIDEO_FPS), "-i", bg_path]
+        vf = "scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,subtitles=karaoke.ass" % (
+            res_x, res_y, res_x, res_y)
+    else:
+        src = ["-f", "lavfi", "-i", "color=c=%s:s=%dx%d:r=%d" % (PREVIEW_BG, res_x, res_y, VIDEO_FPS)]
+        vf = "subtitles=karaoke.ass"
+    # subtitles chạy với cwd=work để khỏi phải escape đường dẫn Windows trong filter
+    cmd = ["ffmpeg", "-v", "error", "-y", "-progress", "pipe:1", "-nostats", *src, "-i", audio_path,
+           "-map", "0:v", "-map", "1:a", "-vf", vf,
+           "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", out_path]
+
+    duration = audio_duration(audio_path)
+    proc = subprocess.Popen(cmd, cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, errors="replace",
+                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    current_process = proc
+    errors = []
+    for line in proc.stdout:
+        line = line.strip()
+        if line.startswith("out_time_us="):
+            if duration:
+                try:
+                    progress_queue.put(60 + 40 * min(int(line.split("=")[1]) / 1e6 / duration, 1))
+                except ValueError:   # "N/A" lúc mới bắt đầu
+                    pass
+        elif line and not re.match(r"^\w+=", line):
+            errors.append(line)
+    proc.wait()
+
+    if not is_running:
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        return False
+    if proc.returncode != 0:
+        log("✖ ffmpeg lỗi: " + " | ".join(errors[-3:]))
+        return False
+    return True
+
+def start_make(video=False):
     global is_running
 
     if is_running:
@@ -655,6 +723,9 @@ def start_make():
     audio_path = audio_var.get()
     if not srt_path:
         messagebox.showerror("Error", "Chưa chọn file SRT")
+        return
+    if video and not audio_path:
+        messagebox.showerror("Error", "Cần chọn file audio để tạo video")
         return
 
     try:
@@ -678,17 +749,20 @@ def start_make():
     countdown = countdown_var.get()   # đọc ở luồng chính, luồng nền không được đụng biến Tk
     res_x = res_y * 16 // 9
 
+    ext = ".mp4" if video else ".ass"
     out_path = filedialog.asksaveasfilename(
-        title="Lưu file ASS", defaultextension=".ass",
+        title="Lưu video" if video else "Lưu file ASS", defaultextension=ext,
         initialdir=os.path.dirname(srt_path),
-        initialfile=os.path.splitext(os.path.basename(srt_path))[0] + ".ass",
-        filetypes=[("ASS files", "*.ass"), ("All files", "*.*")])
+        initialfile=os.path.splitext(os.path.basename(srt_path))[0] + ext,
+        filetypes=[("MP4 files", "*.mp4")] if video else [("ASS files", "*.ass")])
     if not out_path:
         return
+    bg_path = bg_var.get()
 
     progress_var.set(0)
     is_running = True
     start_btn.config(state=tk.DISABLED)
+    video_btn.config(state=tk.DISABLED)
     stop_btn.config(state=tk.NORMAL)
 
     def run():
@@ -700,7 +774,11 @@ def start_make():
         try:
             ass = generate_ass(srt_path, audio_path, bpm, snap, font, size, res_x, res_y,
                               countdown, style)
-            if ass:
+            if ass and video:
+                log("Đang render video...")
+                if render_video(ass, audio_path, bg_path, out_path, res_x, res_y):
+                    log(f"✔ Đã tạo video: {out_path}")
+            elif ass:
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(ass)
                 log(f"✔ Đã lưu: {out_path}")
@@ -734,7 +812,7 @@ def stop_make():
 if __name__ == "__main__":
     root = tk.Tk()
     root.title("Karaoke Maker (SRT → ASS)")
-    root.geometry("850x960")
+    root.geometry("850x1020")
 
     if np is None:
         root.withdraw()
@@ -760,6 +838,15 @@ if __name__ == "__main__":
     ttk.Entry(audio_frame, textvariable=audio_var, state="readonly").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
     ttk.Button(audio_frame, text="Chọn file", command=browse_audio).pack(side=tk.LEFT)
     ttk.Button(audio_frame, text="Xóa", command=lambda: audio_var.set("")).pack(side=tk.LEFT, padx=(5, 0))
+
+    # Background (chỉ dùng khi tạo video)
+    ttk.Label(frame, text="Hình nền video (tùy chọn, không chọn = nền màu tối):").pack(anchor="w")
+    bg_var = tk.StringVar()
+    bg_frame = ttk.Frame(frame)
+    bg_frame.pack(fill=tk.X, pady=5)
+    ttk.Entry(bg_frame, textvariable=bg_var, state="readonly").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+    ttk.Button(bg_frame, text="Chọn file", command=browse_bg).pack(side=tk.LEFT)
+    ttk.Button(bg_frame, text="Xóa", command=lambda: bg_var.set("")).pack(side=tk.LEFT, padx=(5, 0))
 
     # Options
     opt_frame = ttk.Frame(frame)
@@ -846,6 +933,9 @@ if __name__ == "__main__":
 
     start_btn = ttk.Button(btn_frame, text="▶ Create ASS", command=start_make)
     start_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
+
+    video_btn = ttk.Button(btn_frame, text="🎬 Create Video", command=lambda: start_make(video=True))
+    video_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
 
     stop_btn = ttk.Button(btn_frame, text="■ Stop", command=stop_make, state=tk.DISABLED)
     stop_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
