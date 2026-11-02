@@ -50,6 +50,7 @@ FAST_RATE = 5.5         # trên mức này là câu nhanh
 
 LAYOUT_CENTER = "Cả hai dòng căn giữa"
 LAYOUT_SPLIT = "Dòng 1 căn trái, dòng 2 căn phải"
+OUTLINE_ACCEL = 0.4     # <1: viền sáng lên nhanh ở đầu ký tự, ký tự đang tô bớt tối so với hai bên
 VIDEO_FPS = 25
 PREVIEW_SIZE = (480, 270)
 PREVIEW_BG = "0x202020"
@@ -310,8 +311,8 @@ def karaoke_text(spans, line_start, outline_tags=None):
         for k, ch in enumerate(chars):
             c0 = pos + round(dur * k / len(chars))
             c1 = pos + round(dur * (k + 1) / len(chars))
-            parts.append("{\\kf%d%s\\t(%d,%d,%s)}%s%s" % (
-                c1 - c0, outline_tags[0], (c0 - base) * 10, (c1 - base) * 10, outline_tags[1],
+            parts.append("{\\kf%d%s\\t(%d,%d,%s,%s)}%s%s" % (
+                c1 - c0, outline_tags[0], (c0 - base) * 10, (c1 - base) * 10, OUTLINE_ACCEL, outline_tags[1],
                 ch, sep if k == len(chars) - 1 else ""))
         pos += dur
     return "".join(parts)
