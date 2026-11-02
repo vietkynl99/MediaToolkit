@@ -48,8 +48,8 @@ LINGER = 0.5            # câu còn lại sau khi hát xong (giây)
 SLOW_RATE = 2.5         # âm tiết/giây: dưới mức này là câu chậm
 FAST_RATE = 5.5         # trên mức này là câu nhanh
 
-LAYOUT_CENTER = "Cả hai dòng căn giữa"
-LAYOUT_SPLIT = "Dòng 1 căn trái, dòng 2 căn phải"
+LAYOUT_CENTER = "Căn giữa"
+LAYOUT_SPLIT = "Hai bên"
 VIDEO_FPS = 25
 PREVIEW_SIZE = (480, 270)
 PREVIEW_BG = "0x202020"
@@ -62,8 +62,8 @@ PREVIEW_SAMPLE = [(0.0, 3.0, "Đây là dòng lời bài hát thứ nhất"),
 # split_lines: dòng trên căn trái, dòng dưới căn phải (False = cả hai căn giữa).
 DEFAULT_STYLE = {"primary": "#0000FF", "secondary": "#FFFFFF",
                  "outline": "#001030", "outline_sung": "#FFFFFF",
-                 "outline_w": None, "outline_w_sung": None, "split_lines": False,
-                 "margin_l": 120, "margin_r": 120}
+                 "outline_w": None, "outline_w_sung": None, "split_lines": True,
+                 "margin_l": 200, "margin_r": 200}
 
 PUNCT = ",;:.!?…-–—"
 TIME_RE = re.compile(
@@ -595,7 +595,7 @@ def pick_color(var, btn):
         var.set(rgb)
         btn.config(bg=rgb, activebackground=rgb)
 
-def render_preview(srt_path, cue_no, bpm, font, size, res_x, res_y, style):
+def render_preview(srt_path, cue_no, bpm, font, size, res_x, res_y, style, bg_path=None):
     """Vẽ một khung hình bằng ffmpeg (libass) rồi báo đường dẫn PNG về luồng chính."""
     png = None
     try:
@@ -621,9 +621,14 @@ def render_preview(srt_path, cue_no, bpm, font, size, res_x, res_y, style):
 
         # setpts đẩy khung hình duy nhất tới thời điểm t để libass vẽ đúng câu đang hát;
         # settb 1/1000 vì time base mặc định 1/1 làm tròn t xuống giây nguyên
-        cmd = ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
-               "-i", "color=c=%s:s=%dx%d:r=1:d=1" % (PREVIEW_BG, *PREVIEW_SIZE),
-               "-vf", "settb=1/1000,setpts=PTS+%.3f/TB,subtitles=preview.ass" % t,
+        if bg_path:
+            src = ["-loop", "1", "-framerate", "1", "-i", bg_path]
+            fit = "scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d," % (PREVIEW_SIZE * 2)
+        else:
+            src = ["-f", "lavfi", "-i", "color=c=%s:s=%dx%d:r=1:d=1" % (PREVIEW_BG, *PREVIEW_SIZE)]
+            fit = ""
+        cmd = ["ffmpeg", "-v", "error", "-y", *src,
+               "-vf", "%ssettb=1/1000,setpts=PTS+%.3f/TB,subtitles=preview.ass" % (fit, t),
                "-frames:v", "1", "preview.png"]
         r = subprocess.run(cmd, cwd=work, capture_output=True, text=True, errors="replace",
                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
@@ -665,7 +670,7 @@ def start_preview():
     threading.Thread(
         target=render_preview,
         args=(srt_var.get(), cue_no, bpm, font_var.get().strip() or "Arial", size,
-              res_y * 16 // 9, res_y, style),
+              res_y * 16 // 9, res_y, style, bg_var.get() or None),
         daemon=True).start()
 
 def audio_duration(path):
@@ -873,7 +878,7 @@ if __name__ == "__main__":
 
     bpm_var = tk.StringVar()
     font_var = tk.StringVar(value="Arial")
-    size_var = tk.StringVar(value="64")
+    size_var = tk.StringVar(value="86")
     res_var = tk.StringVar(value="1080")
 
     ttk.Label(opt_frame, text="BPM:").grid(row=0, column=0, sticky="w", padx=5)
@@ -905,7 +910,7 @@ if __name__ == "__main__":
         ttk.Label(opt_frame, text="Độ dày viền:").grid(row=row, column=5, sticky="w", padx=5)
         ttk.Spinbox(opt_frame, from_=0, to=30, textvariable=width_var, width=8).grid(row=row, column=6, padx=5)
 
-    layout_var = tk.StringVar(value=LAYOUT_CENTER)
+    layout_var = tk.StringVar(value=LAYOUT_SPLIT if DEFAULT_STYLE["split_lines"] else LAYOUT_CENTER)
     ttk.Label(opt_frame, text="Kiểu 2 dòng:").grid(row=4, column=0, sticky="w", padx=5, pady=3)
     ttk.Combobox(opt_frame, textvariable=layout_var, values=[LAYOUT_CENTER, LAYOUT_SPLIT],
                  state="readonly", width=34).grid(row=4, column=1, columnspan=3, sticky="w", padx=5)
@@ -935,7 +940,7 @@ if __name__ == "__main__":
     preview_timer = None
     preview_label = ttk.Label(right, text="(chưa có preview)", anchor="center")
     preview_label.pack(pady=5)
-    for v in (srt_var, font_var, size_var, res_var, bpm_var, cue_var,
+    for v in (srt_var, bg_var, font_var, size_var, res_var, bpm_var, cue_var,
               primary_var, secondary_var, outline_var, outline_sung_var,
               outline_w_var, outline_w_sung_var, layout_var, margin_l_var, margin_r_var):
         v.trace_add("write", schedule_preview)
