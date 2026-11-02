@@ -35,7 +35,7 @@ MIN_WORD = 0.06        # từ ngắn nhất sau khi snap (giây)
 SNAP_RATIO = 0.35       # snap onset trong +-35% độ dài âm tiết trung bình
 SHORT_WORD = 0.15       # từ ngắn hơn mức này dùng \k thay vì \kf
 
-DEFAULT_LEAD_IN = 2.0   # lời hiện trước lúc hát tối thiểu bao lâu (giây), chỉnh trên UI
+DEFAULT_LEAD_IN = 2.0   # lời hiện trước lúc hát tối thiểu bao lâu (giây)
 COUNTDOWN_BEATS = 4     # số chấm đếm ngược trước câu đầu bài (chỉ hiện một lần)
 VERSE_READ_TIME = 1.5   # thời gian đọc/lấy hơi cộng thêm vào phần đếm ngược khi tự tính
 VERSE_LEAD_RANGE = (3.0, 8.0)  # chặn hiện trước đầu đoạn khi tự tính (giây)
@@ -43,7 +43,7 @@ COUNTDOWN_HOLD = 0.25   # chấm cuối còn sáng thêm sau khi bắt đầu h�
 MIN_DOT_INTERVAL = 0.8  # mỗi chấm tối thiểu bao lâu để kịp bắt nhịp (giây), nhanh hơn thì gộp thêm nhịp
 MAX_DOT_BEATS = 4       # tối đa số nhịp mỗi chấm khi tự tính
 PHASE_WINDOW = 10.0     # đoạn audio (giây) trước đầu đoạn dùng để dò pha của phách
-DEFAULT_GAP_LONG = 4.0 # nghỉ giữa 2 câu dài hơn mức này thì tách nhóm, chỉnh trên UI
+DEFAULT_GAP_LONG = 4.0 # nghỉ giữa 2 câu dài hơn mức này thì tách nhóm
 LINGER = 0.5            # câu còn lại sau khi hát xong (giây)
 SLOW_RATE = 2.5         # âm tiết/giây: dưới mức này là câu chậm
 FAST_RATE = 5.5         # trên mức này là câu nhanh
@@ -295,7 +295,7 @@ def countdown_text(t0, lit, t_end):
     return "".join(parts)
 
 def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_IN, gap_long=DEFAULT_GAP_LONG,
-              verse_lead=None, countdown=True, phase_at=None, use_end=False):
+              verse_lead=None, countdown=True, phase_at=None):
     """verse_lead=None: tự tính = thời gian đếm ngược + thời gian đọc.
 
     Mỗi chấm dài số nhịp nguyên nhỏ nhất sao cho >= MIN_DOT_INTERVAL.
@@ -348,7 +348,7 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
         if i + 1 < len(cues):
             window = cues[i + 1][0] - start
             # end của SRT hay bị kéo dài/chồng câu sau: chỉ tin khi nằm trong (start, start câu sau]
-            if use_end and start < end <= cues[i + 1][0]:
+            if start < end <= cues[i + 1][0]:
                 window = min(window, max(end - start, n_syl * bpm_syl) + END_TOLERANCE)
         else:
             window = max(end - start, n_syl * bpm_syl + TAIL_NO_NEXT)
@@ -472,8 +472,7 @@ def process_queues():
             stop_btn.config(state=tk.DISABLED)
     root.after(100, process_queues)
 
-def generate_ass(srt_path, audio_path, bpm, snap, font, size, res_x, res_y, lead_in, gap_long, verse_lead,
-                 countdown, use_end=False):
+def generate_ass(srt_path, audio_path, bpm, snap, font, size, res_x, res_y, countdown):
     """SRT (+ audio) → nội dung ASS. Trả về None nếu không tạo được."""
     cues = parse_srt(srt_path)
     if not cues:
@@ -511,8 +510,8 @@ def generate_ass(srt_path, audio_path, bpm, snap, font, size, res_x, res_y, lead
         beat = 60.0 / bpm
         phase_at = lambda t: beat_grid_phase(flux, beat, t)
         log("Canh chấm đếm ngược theo phách của audio")
-    return build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in, gap_long, verse_lead,
-                     countdown, phase_at, use_end)
+    return build_ass(cues, bpm, onsets, font, size, res_x, res_y,
+                     countdown=countdown, phase_at=phase_at)
 
 def start_make():
     global is_running
@@ -531,24 +530,16 @@ def start_make():
         bpm = float(bpm_text) if bpm_text else None
         size = int(size_var.get())
         res_y = int(res_var.get())
-        lead_in = float(lead_var.get())
-        gap_long = float(gap_var.get())
-        verse_text = verse_var.get().strip()
-        verse_lead = float(verse_text) if verse_text else None   # trống = tự tính theo nhịp
     except ValueError:
-        messagebox.showerror("Error", "BPM, cỡ chữ, độ phân giải hoặc thời gian hiển thị không hợp lệ")
-        return
-    if min(lead_in, gap_long, verse_lead if verse_lead is not None else 0) < 0:
-        messagebox.showerror("Error", "Thời gian hiển thị không được âm")
+        messagebox.showerror("Error", "BPM, cỡ chữ hoặc độ phân giải không hợp lệ")
         return
     if bpm is not None and bpm <= 0:
         messagebox.showerror("Error", "BPM phải lớn hơn 0")
         return
 
     font = font_var.get().strip() or "Arial"
-    snap = snap_var.get() and bool(audio_path)
+    snap = bool(audio_path)
     countdown = countdown_var.get()   # đọc ở luồng chính, luồng nền không được đụng biến Tk
-    use_end = use_end_var.get()
     res_x = res_y * 16 // 9
 
     progress_var.set(0)
@@ -564,7 +555,7 @@ def start_make():
 
         try:
             ass = generate_ass(srt_path, audio_path, bpm, snap, font, size, res_x, res_y,
-                              lead_in, gap_long, verse_lead, countdown, use_end)
+                              countdown)
             if ass:
                 out_path = os.path.splitext(srt_path)[0] + ".ass"
                 with open(out_path, "w", encoding="utf-8") as f:
@@ -635,7 +626,6 @@ if __name__ == "__main__":
     font_var = tk.StringVar(value="Arial")
     size_var = tk.StringVar(value="64")
     res_var = tk.StringVar(value="1080")
-    snap_var = tk.BooleanVar(value=True)
 
     ttk.Label(opt_frame, text="BPM:").grid(row=0, column=0, sticky="w", padx=5)
     ttk.Entry(opt_frame, textvariable=bpm_var, width=10).grid(row=0, column=1, padx=5)
@@ -648,29 +638,9 @@ if __name__ == "__main__":
     ttk.Label(opt_frame, text="Cao video:").grid(row=1, column=4, sticky="w", padx=5)
     ttk.Spinbox(opt_frame, from_=360, to=2160, increment=360, textvariable=res_var, width=8).grid(row=1, column=5, padx=5)
 
-    ttk.Checkbutton(opt_frame, text="Snap ranh giới từ vào onset của audio", variable=snap_var).grid(
-        row=2, column=0, columnspan=4, sticky="w", padx=5)
-    use_end_var = tk.BooleanVar(value=False)
-    ttk.Checkbutton(opt_frame, text="Dùng mốc kết thúc của SRT", variable=use_end_var).grid(
-        row=2, column=4, columnspan=2, sticky="w", padx=5)
-
-    lead_var = tk.StringVar(value=str(DEFAULT_LEAD_IN))
-    gap_var = tk.StringVar(value=str(DEFAULT_GAP_LONG))
-    ttk.Label(opt_frame, text="Hiện lời trước (s):").grid(row=3, column=0, sticky="w", padx=5, pady=5)
-    ttk.Entry(opt_frame, textvariable=lead_var, width=10).grid(row=3, column=1, padx=5)
-    ttk.Label(opt_frame, text="Tách nhóm nếu nghỉ > (s):").grid(row=3, column=2, sticky="w", padx=5)
-    ttk.Entry(opt_frame, textvariable=gap_var, width=8).grid(row=3, column=3, padx=5)
-    ttk.Label(opt_frame, text="(câu liền mạch hiện 2 dòng, nghỉ dài thì chỉ hiện câu sắp hát)").grid(
-        row=3, column=4, columnspan=2, sticky="w", padx=5)
-
-    verse_var = tk.StringVar()
     countdown_var = tk.BooleanVar(value=True)
-    ttk.Label(opt_frame, text="Hiện trước khi vào đoạn mới (s):").grid(row=4, column=0, columnspan=2, sticky="w", padx=5)
-    ttk.Entry(opt_frame, textvariable=verse_var, width=10).grid(row=4, column=2, sticky="w", padx=5)
-    ttk.Label(opt_frame, text="(để trống = 4 nhịp + 1,5s: bài chậm tự hiện sớm hơn bài nhanh)").grid(
-        row=4, column=3, columnspan=3, sticky="w", padx=5)
     ttk.Checkbutton(opt_frame, text="Đếm ngược 4 chấm theo nhịp ở đầu bài", variable=countdown_var).grid(
-        row=5, column=0, columnspan=4, sticky="w", padx=5, pady=(0, 5))
+        row=2, column=0, columnspan=4, sticky="w", padx=5, pady=(5, 5))
 
     # Progress
     progress_var = tk.DoubleVar()
