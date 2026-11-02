@@ -438,7 +438,9 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
         slot = 1 - slots[i - 1] if connected else 0
         groups.append(groups[-1] if connected else len(groups))
 
-        if connected:
+        if connected and slots[i - 1] == 0 and (i == 1 or groups[i - 2] != groups[i - 1]):
+            show = shows[i - 1]     # câu thứ 2 của đoạn hiện cùng lúc với câu đầu
+        elif connected:
             show = min(start - lead_in, plans[i - 1][0])
         else:   # mở đầu đoạn: hiện sớm hơn để kịp chuẩn bị, nhưng không chen vào câu đang hát
             show = start - max(verse_lead, lead_in)
