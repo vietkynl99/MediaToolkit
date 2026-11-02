@@ -51,7 +51,7 @@ FAST_RATE = 5.5         # trên mức này là câu nhanh
 LAYOUT_CENTER = "Cả hai dòng căn giữa"
 LAYOUT_SPLIT = "Dòng 1 căn trái, dòng 2 căn phải"
 VIDEO_FPS = 25
-PREVIEW_SIZE = (640, 360)
+PREVIEW_SIZE = (480, 270)
 PREVIEW_BG = "0x202020"
 PREVIEW_DEBOUNCE_MS = 500
 PREVIEW_SAMPLE = [(0.0, 3.0, "Đây là dòng lời bài hát thứ nhất"),
@@ -812,7 +812,7 @@ def stop_make():
 if __name__ == "__main__":
     root = tk.Tk()
     root.title("Karaoke Maker (SRT → ASS)")
-    root.geometry("850x1020")
+    root.geometry("1180x640")
 
     if np is None:
         root.withdraw()
@@ -821,35 +821,40 @@ if __name__ == "__main__":
 
     frame = ttk.Frame(root, padding=10)
     frame.pack(fill=tk.BOTH, expand=True)
+    # hai cột để không vượt chiều cao màn hình: trái = nhập liệu, phải = preview + log
+    left = ttk.Frame(frame)
+    left.pack(side=tk.LEFT, fill=tk.Y, anchor="n")
+    right = ttk.Frame(frame)
+    right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(15, 0))
 
     # SRT select
-    ttk.Label(frame, text="File SRT (mốc từng câu):").pack(anchor="w")
+    ttk.Label(left, text="File SRT (mốc từng câu):").pack(anchor="w")
     srt_var = tk.StringVar()
-    srt_frame = ttk.Frame(frame)
+    srt_frame = ttk.Frame(left)
     srt_frame.pack(fill=tk.X, pady=5)
     ttk.Entry(srt_frame, textvariable=srt_var, state="readonly").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
     ttk.Button(srt_frame, text="Chọn file", command=browse_srt).pack(side=tk.LEFT)
 
     # Audio select
-    ttk.Label(frame, text="File audio (tùy chọn, để bám nhịp / khớp từ vào âm thanh):").pack(anchor="w")
+    ttk.Label(left, text="File audio (tùy chọn, để bám nhịp / khớp từ vào âm thanh):").pack(anchor="w")
     audio_var = tk.StringVar()
-    audio_frame = ttk.Frame(frame)
+    audio_frame = ttk.Frame(left)
     audio_frame.pack(fill=tk.X, pady=5)
     ttk.Entry(audio_frame, textvariable=audio_var, state="readonly").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
     ttk.Button(audio_frame, text="Chọn file", command=browse_audio).pack(side=tk.LEFT)
     ttk.Button(audio_frame, text="Xóa", command=lambda: audio_var.set("")).pack(side=tk.LEFT, padx=(5, 0))
 
     # Background (chỉ dùng khi tạo video)
-    ttk.Label(frame, text="Hình nền video (tùy chọn, không chọn = nền màu tối):").pack(anchor="w")
+    ttk.Label(left, text="Hình nền video (tùy chọn, không chọn = nền màu tối):").pack(anchor="w")
     bg_var = tk.StringVar()
-    bg_frame = ttk.Frame(frame)
+    bg_frame = ttk.Frame(left)
     bg_frame.pack(fill=tk.X, pady=5)
     ttk.Entry(bg_frame, textvariable=bg_var, state="readonly").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
     ttk.Button(bg_frame, text="Chọn file", command=browse_bg).pack(side=tk.LEFT)
     ttk.Button(bg_frame, text="Xóa", command=lambda: bg_var.set("")).pack(side=tk.LEFT, padx=(5, 0))
 
     # Options
-    opt_frame = ttk.Frame(frame)
+    opt_frame = ttk.Frame(left)
     opt_frame.pack(fill=tk.X, pady=5)
 
     bpm_var = tk.StringVar()
@@ -905,7 +910,7 @@ if __name__ == "__main__":
         row=6, column=0, columnspan=4, sticky="w", padx=5, pady=(5, 5))
 
     # Preview
-    preview_frame = ttk.Frame(frame)
+    preview_frame = ttk.Frame(right)
     preview_frame.pack(fill=tk.X, pady=5)
     cue_var = tk.StringVar(value="1")
     ttk.Label(preview_frame, text="Xem trước câu số:").pack(side=tk.LEFT, padx=5)
@@ -914,7 +919,7 @@ if __name__ == "__main__":
     preview_busy = False
     preview_dirty = False
     preview_timer = None
-    preview_label = ttk.Label(frame, text="(chưa có preview)", anchor="center")
+    preview_label = ttk.Label(right, text="(chưa có preview)", anchor="center")
     preview_label.pack(pady=5)
     for v in (srt_var, font_var, size_var, res_var, bpm_var, cue_var,
               primary_var, secondary_var, outline_var, outline_sung_var,
@@ -924,11 +929,11 @@ if __name__ == "__main__":
 
     # Progress
     progress_var = tk.DoubleVar()
-    progress_bar = ttk.Progressbar(frame, variable=progress_var, maximum=100)
+    progress_bar = ttk.Progressbar(right, variable=progress_var, maximum=100)
     progress_bar.pack(fill=tk.X, pady=10)
 
     # Control buttons
-    btn_frame = ttk.Frame(frame)
+    btn_frame = ttk.Frame(left)
     btn_frame.pack(fill=tk.X, pady=10)
 
     start_btn = ttk.Button(btn_frame, text="▶ Create ASS", command=start_make)
@@ -941,9 +946,9 @@ if __name__ == "__main__":
     stop_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
 
     # Log box
-    ttk.Label(frame, text="Log:").pack(anchor="w")
+    ttk.Label(right, text="Log:").pack(anchor="w")
 
-    log_text = tk.Text(frame, height=6)
+    log_text = tk.Text(right, height=6, width=10)
     log_text.pack(fill=tk.BOTH, expand=True, pady=5)
 
     # Start log polling
