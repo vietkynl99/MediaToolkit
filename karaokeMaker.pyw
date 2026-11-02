@@ -48,16 +48,21 @@ LINGER = 0.5            # câu còn lại sau khi hát xong (giây)
 SLOW_RATE = 2.5         # âm tiết/giây: dưới mức này là câu chậm
 FAST_RATE = 5.5         # trên mức này là câu nhanh
 
+LAYOUT_CENTER = "Cả hai dòng căn giữa"
+LAYOUT_SPLIT = "Dòng 1 căn trái, dòng 2 căn phải"
 PREVIEW_SIZE = (640, 360)
 PREVIEW_BG = "0x202020"
 PREVIEW_DEBOUNCE_MS = 500
 PREVIEW_SAMPLE = [(0.0, 3.0, "Đây là dòng lời bài hát thứ nhất"),
-                  (3.0, 6.0, "Dòng thứ hai hiện ở bên dưới")]
+                  (3.0, 6.0, "Dòng thứ hai hiện ở bên dưới"),
+                  (6.0, 9.0, "Dòng thứ ba quay lại bên trên")]
 # outline/outline_w là viền chữ chưa hát, *_sung là viền chữ đã hát.
 # outline_w=None: tự theo cỡ chữ; outline_w_sung=None: giống chưa hát.
+# split_lines: dòng trên căn trái, dòng dưới căn phải (False = cả hai căn giữa).
 DEFAULT_STYLE = {"primary": "#0000FF", "secondary": "#FFFFFF",
                  "outline": "#001030", "outline_sung": "#FFFFFF",
-                 "outline_w": None, "outline_w_sung": None}
+                 "outline_w": None, "outline_w_sung": None, "split_lines": False,
+                 "margin_l": 120, "margin_r": 120}
 
 PUNCT = ",;:.!?…-–—"
 TIME_RE = re.compile(
@@ -345,6 +350,9 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
     outline_w = style["outline_w"] or max(size // 16, 2)
     outline_sung = ass_colour(style["outline_sung"])
     outline_w_sung = style["outline_w_sung"] if style["outline_w_sung"] is not None else outline_w
+    # \an của ASS: 1 = dưới-trái, 2 = dưới-giữa, 3 = dưới-phải
+    margin_l, margin_r = style["margin_l"], style["margin_r"]
+    align_top, align_bottom = (1, 3) if style["split_lines"] else (2, 2)
     outline_tags = None
     if (outline_sung, outline_w_sung) != (outline, outline_w):
         outline_tags = ("\\3c%s\\bord%d" % (outline, outline_w),
@@ -363,12 +371,12 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
         # Primary = màu đã hát, Secondary = màu chưa hát
         f"Style: Bottom,{font},{size},{primary},{secondary},{outline},&H80000000,"
-        f"-1,0,0,0,100,100,0,0,1,{outline_w},1,2,60,60,{margin},1\n"
+        f"-1,0,0,0,100,100,0,0,1,{outline_w},1,{align_bottom},{margin_l},{margin_r},{margin},1\n"
         f"Style: Top,{font},{size},{primary},{secondary},{outline},&H80000000,"
-        f"-1,0,0,0,100,100,0,0,1,{outline_w},1,2,60,60,{margin + gap},1\n"
-        # đếm ngược nằm phía trên dòng trên cùng
+        f"-1,0,0,0,100,100,0,0,1,{outline_w},1,{align_top},{margin_l},{margin_r},{margin + gap},1\n"
+        # đếm ngược nằm phía trên dòng trên cùng, cùng căn lề với nó
         f"Style: Count,{font},{dot_size},{primary},{secondary},{outline},&H80000000,"
-        f"-1,0,0,0,100,100,0,0,1,{max(dot_size // 16, 2)},1,2,60,60,{margin + 2 * gap},1\n\n"
+        f"-1,0,0,0,100,100,0,0,1,{max(dot_size // 16, 2)},1,{align_top},{margin_l},{margin_r},{margin + 2 * gap},1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
@@ -501,14 +509,14 @@ def process_queues():
     while not result_queue.empty():
         kind, payload = result_queue.get()
         if kind == "preview":
-            global preview_img, preview_dirty
-            preview_btn.config(state=tk.NORMAL)
+            global preview_img, preview_dirty, preview_busy
+            preview_busy = False
             if payload:
                 preview_img = tk.PhotoImage(file=payload)
                 preview_label.config(image=preview_img, text="")
             if preview_dirty:   # thông số đổi trong lúc đang vẽ
                 preview_dirty = False
-                start_preview(silent=True)
+                start_preview()
         elif kind == "done":
             start_btn.config(state=tk.NORMAL)
             stop_btn.config(state=tk.DISABLED)
@@ -548,13 +556,15 @@ def generate_ass(srt_path, audio_path, bpm, snap, font, size, res_x, res_y, coun
                      countdown=countdown, phase_at=phase_at, style=style)
 
 def read_style():
-    """Đọc ở luồng chính; ValueError nếu độ dày viền không phải số nguyên."""
+    """Đọc ở luồng chính; ValueError nếu độ dày viền hoặc lề không phải số nguyên."""
     ow = outline_w_var.get().strip()
     ow_sung = outline_w_sung_var.get().strip()
     return {"primary": primary_var.get(), "secondary": secondary_var.get(),
             "outline": outline_var.get(), "outline_sung": outline_sung_var.get(),
             "outline_w": int(ow) if ow else None,
-            "outline_w_sung": int(ow_sung) if ow_sung else None}
+            "outline_w_sung": int(ow_sung) if ow_sung else None,
+            "split_lines": layout_var.get() == LAYOUT_SPLIT,
+            "margin_l": int(margin_l_var.get()), "margin_r": int(margin_r_var.get())}
 
 def pick_color(var, btn):
     rgb = colorchooser.askcolor(color=var.get(), parent=root)[1]
@@ -608,12 +618,12 @@ def schedule_preview(*_):
     global preview_timer
     if preview_timer:
         root.after_cancel(preview_timer)
-    preview_timer = root.after(PREVIEW_DEBOUNCE_MS, lambda: start_preview(silent=True))
+    preview_timer = root.after(PREVIEW_DEBOUNCE_MS, start_preview)
 
-def start_preview(silent=False):
-    global preview_dirty, preview_timer
+def start_preview():
+    global preview_dirty, preview_timer, preview_busy
     preview_timer = None
-    if str(preview_btn.cget("state")) == "disabled":
+    if preview_busy:
         preview_dirty = True
         return
     try:
@@ -623,16 +633,12 @@ def start_preview(silent=False):
         res_y = int(res_var.get())
         cue_no = int(cue_var.get())
         style = read_style()
-    except ValueError:
-        if not silent:   # đang gõ dở thì im lặng, chờ giá trị hợp lệ
-            messagebox.showerror("Error", "BPM, cỡ chữ, độ phân giải, độ dày viền hoặc số câu không hợp lệ")
+    except ValueError:   # đang gõ dở: im lặng chờ giá trị hợp lệ
         return
     if bpm is not None and bpm <= 0:
-        if not silent:
-            messagebox.showerror("Error", "BPM phải lớn hơn 0")
         return
 
-    preview_btn.config(state=tk.DISABLED)
+    preview_busy = True
     threading.Thread(
         target=render_preview,
         args=(srt_var.get(), cue_no, bpm, font_var.get().strip() or "Arial", size,
@@ -661,7 +667,7 @@ def start_make():
         res_y = int(res_var.get())
         style = read_style()
     except ValueError:
-        messagebox.showerror("Error", "BPM, cỡ chữ, độ phân giải hoặc độ dày viền không hợp lệ")
+        messagebox.showerror("Error", "BPM, cỡ chữ, độ phân giải, độ dày viền hoặc lề không hợp lệ")
         return
     if bpm <= 0:
         messagebox.showerror("Error", "BPM phải lớn hơn 0")
@@ -740,7 +746,7 @@ if __name__ == "__main__":
     ttk.Button(srt_frame, text="Chọn file", command=browse_srt).pack(side=tk.LEFT)
 
     # Audio select
-    ttk.Label(frame, text="File audio (tùy chọn, để đo BPM / bám nhịp):").pack(anchor="w")
+    ttk.Label(frame, text="File audio (tùy chọn, để bám nhịp / khớp từ vào âm thanh):").pack(anchor="w")
     audio_var = tk.StringVar()
     audio_frame = ttk.Frame(frame)
     audio_frame.pack(fill=tk.X, pady=5)
@@ -759,7 +765,6 @@ if __name__ == "__main__":
 
     ttk.Label(opt_frame, text="BPM:").grid(row=0, column=0, sticky="w", padx=5)
     ttk.Entry(opt_frame, textvariable=bpm_var, width=10).grid(row=0, column=1, padx=5)
-    ttk.Label(opt_frame, text="(bắt buộc; để trống thì preview tạm dùng 120)").grid(row=0, column=2, columnspan=3, sticky="w", padx=5)
 
     ttk.Label(opt_frame, text="Font:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
     ttk.Entry(opt_frame, textvariable=font_var, width=16).grid(row=1, column=1, padx=5)
@@ -774,23 +779,32 @@ if __name__ == "__main__":
     outline_sung_var = tk.StringVar(value=DEFAULT_STYLE["outline_sung"])
     outline_w_var = tk.StringVar()
     outline_w_sung_var = tk.StringVar()
-    color_rows = [
-        (2, [("Màu chữ đã hát:", primary_var), ("Màu chữ chưa hát:", secondary_var)]),
-        (3, [("Màu viền đã hát:", outline_sung_var), ("Màu viền chưa hát:", outline_var)]),
-    ]
-    for row, items in color_rows:
-        for col, (label, var) in enumerate(items):
-            ttk.Label(opt_frame, text=label).grid(row=row, column=col * 2, sticky="w", padx=5)
+    # mỗi trạng thái (đã hát / chưa hát) một dòng: màu chữ, màu viền, độ dày viền
+    for row, (title, fill_var, outline_color_var, width_var) in enumerate([
+            ("Chữ đã hát:", primary_var, outline_sung_var, outline_w_sung_var),
+            ("Chữ chưa hát:", secondary_var, outline_var, outline_w_var)], start=2):
+        ttk.Label(opt_frame, text=title).grid(row=row, column=0, sticky="w", padx=5, pady=3)
+        for col, (label, var) in enumerate([("Màu chữ:", fill_var), ("Màu viền:", outline_color_var)]):
+            ttk.Label(opt_frame, text=label).grid(row=row, column=1 + col * 2, sticky="w", padx=5)
             btn = tk.Button(opt_frame, width=9, text="", bg=var.get(), activebackground=var.get())
             btn.config(command=lambda v=var, b=btn: pick_color(v, b))
-            btn.grid(row=row, column=col * 2 + 1, padx=5, pady=3)
+            btn.grid(row=row, column=2 + col * 2, padx=5)
+        ttk.Label(opt_frame, text="Độ dày viền:").grid(row=row, column=5, sticky="w", padx=5)
+        ttk.Spinbox(opt_frame, from_=0, to=30, textvariable=width_var, width=8).grid(row=row, column=6, padx=5)
 
-    ttk.Label(opt_frame, text="Viền đã hát:").grid(row=4, column=0, sticky="w", padx=5)
-    ttk.Spinbox(opt_frame, from_=0, to=30, textvariable=outline_w_sung_var, width=8).grid(row=4, column=1, padx=5)
-    ttk.Label(opt_frame, text="Viền chưa hát:").grid(row=4, column=2, sticky="w", padx=5)
-    ttk.Spinbox(opt_frame, from_=0, to=30, textvariable=outline_w_var, width=8).grid(row=4, column=3, padx=5)
-    ttk.Label(opt_frame, text="(độ dày chưa hát để trống = tự theo cỡ chữ; đã hát để trống = giống chưa hát)").grid(
-        row=5, column=0, columnspan=6, sticky="w", padx=5)
+    layout_var = tk.StringVar(value=LAYOUT_CENTER)
+    ttk.Label(opt_frame, text="Kiểu 2 dòng:").grid(row=4, column=0, sticky="w", padx=5, pady=3)
+    ttk.Combobox(opt_frame, textvariable=layout_var, values=[LAYOUT_CENTER, LAYOUT_SPLIT],
+                 state="readonly", width=34).grid(row=4, column=1, columnspan=3, sticky="w", padx=5)
+
+    margin_l_var = tk.StringVar(value=str(DEFAULT_STYLE["margin_l"]))
+    margin_r_var = tk.StringVar(value=str(DEFAULT_STYLE["margin_r"]))
+    ttk.Label(opt_frame, text="Lề trái:").grid(row=5, column=0, sticky="w", padx=5, pady=3)
+    ttk.Spinbox(opt_frame, from_=0, to=2000, increment=10, textvariable=margin_l_var, width=8).grid(
+        row=5, column=1, padx=5)
+    ttk.Label(opt_frame, text="Lề phải:").grid(row=5, column=2, sticky="w", padx=5)
+    ttk.Spinbox(opt_frame, from_=0, to=2000, increment=10, textvariable=margin_r_var, width=8).grid(
+        row=5, column=3, padx=5)
 
     countdown_var = tk.BooleanVar(value=True)
     ttk.Checkbutton(opt_frame, text="Đếm ngược 4 chấm theo nhịp ở đầu bài", variable=countdown_var).grid(
@@ -802,17 +816,15 @@ if __name__ == "__main__":
     cue_var = tk.StringVar(value="1")
     ttk.Label(preview_frame, text="Xem trước câu số:").pack(side=tk.LEFT, padx=5)
     ttk.Spinbox(preview_frame, from_=1, to=9999, textvariable=cue_var, width=6).pack(side=tk.LEFT)
-    preview_btn = ttk.Button(preview_frame, text="Xem trước", command=start_preview)
-    preview_btn.pack(side=tk.LEFT, padx=10)
-    ttk.Label(preview_frame, text="(không chọn SRT thì dùng câu mẫu; cần ffmpeg có libass)").pack(side=tk.LEFT)
     preview_img = None
+    preview_busy = False
     preview_dirty = False
     preview_timer = None
     preview_label = ttk.Label(frame, text="(chưa có preview)", anchor="center")
     preview_label.pack(pady=5)
     for v in (srt_var, font_var, size_var, res_var, bpm_var, cue_var,
               primary_var, secondary_var, outline_var, outline_sung_var,
-              outline_w_var, outline_w_sung_var):
+              outline_w_var, outline_w_sung_var, layout_var, margin_l_var, margin_r_var):
         v.trace_add("write", schedule_preview)
     schedule_preview()
 
