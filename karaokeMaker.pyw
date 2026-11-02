@@ -678,6 +678,14 @@ def start_make():
     countdown = countdown_var.get()   # đọc ở luồng chính, luồng nền không được đụng biến Tk
     res_x = res_y * 16 // 9
 
+    out_path = filedialog.asksaveasfilename(
+        title="Lưu file ASS", defaultextension=".ass",
+        initialdir=os.path.dirname(srt_path),
+        initialfile=os.path.splitext(os.path.basename(srt_path))[0] + ".ass",
+        filetypes=[("ASS files", "*.ass"), ("All files", "*.*")])
+    if not out_path:
+        return
+
     progress_var.set(0)
     is_running = True
     start_btn.config(state=tk.DISABLED)
@@ -693,7 +701,6 @@ def start_make():
             ass = generate_ass(srt_path, audio_path, bpm, snap, font, size, res_x, res_y,
                               countdown, style)
             if ass:
-                out_path = os.path.splitext(srt_path)[0] + ".ass"
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(ass)
                 log(f"✔ Đã lưu: {out_path}")
