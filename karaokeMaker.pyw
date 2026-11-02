@@ -317,15 +317,22 @@ def karaoke_text(spans, line_start, outline_tags=None):
         pos += dur
     return "".join(parts)
 
-def countdown_text(t0, lit, t_end):
+def countdown_text(t0, lit, t_end, outline_tags=None):
     """Các chấm hiện trắng từ t0, chấm thứ j sáng lên tại lit[j], chấm cuối sáng đến t_end.
+
+    outline_tags = (chưa sáng, đã sáng): chấm sáng lên thì viền đổi theo như chữ đã hát.
 
     Ranh giới làm tròn theo thời điểm tuyệt đối nên khớp với ass_time(t0) và không lệch tích lũy.
     """
     bounds = [int(round(t * 100)) for t in [t0] + list(lit) + [t_end]]
     parts = ["{\\k%d}" % (bounds[1] - bounds[0])]   # chờ đến khi chấm đầu sáng
     for j in range(len(lit)):
-        parts.append("{\\k%d}●%s" % (bounds[j + 2] - bounds[j + 1], "  " if j < len(lit) - 1 else ""))
+        outline_shift = ""
+        if outline_tags:
+            at = (bounds[j + 1] - bounds[0]) * 10
+            outline_shift = "%s\\t(%d,%d,%s)" % (outline_tags[0], at, at + 10, outline_tags[1])
+        parts.append("{\\k%d%s}●%s" % (bounds[j + 2] - bounds[j + 1], outline_shift,
+                                       "  " if j < len(lit) - 1 else ""))
     return "".join(parts)
 
 def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_IN, gap_long=DEFAULT_GAP_LONG,
@@ -359,6 +366,11 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
     if (outline_sung, outline_w_sung) != (outline, outline_w):
         outline_tags = ("\\3c%s\\bord%d" % (outline, outline_w),
                         "\\3c%s\\bord%d" % (outline_sung, outline_w_sung))
+    dot_w = max(dot_size // 16, 2)
+    dot_w_sung = dot_w if outline_w_sung == outline_w else max(round(outline_w_sung * dot_size / size), 1)
+    dot_outline_tags = None
+    if outline_tags:
+        dot_outline_tags = ("\\3c%s\\bord%d" % (outline, dot_w), "\\3c%s\\bord%d" % (outline_sung, dot_w_sung))
 
     header = (
         "[Script Info]\n"
@@ -378,7 +390,7 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
         f"-1,0,0,0,100,100,0,0,1,{outline_w},1,{align_top},{margin_l},{margin_r},{margin + gap},1\n"
         # đếm ngược nằm phía trên dòng trên cùng, cùng căn lề với nó
         f"Style: Count,{font},{dot_size},{primary},{secondary},{outline},&H80000000,"
-        f"-1,0,0,0,100,100,0,0,1,{max(dot_size // 16, 2)},1,{align_top},{margin_l},{margin_r},{margin + 2 * gap},1\n\n"
+        f"-1,0,0,0,100,100,0,0,1,{dot_w},1,{align_top},{margin_l},{margin_r},{margin + 2 * gap},1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
@@ -478,7 +490,7 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
                 t_end = max(last, start) + COUNTDOWN_HOLD
                 events.append("Dialogue: 1,%s,%s,Count,,0,0,0,,%s" % (
                     ass_time(t0), ass_time(t_end),
-                    "{\\fad(150,150)}" + countdown_text(t0, lit, t_end)))
+                    "{\\fad(150,150)}" + countdown_text(t0, lit, t_end, dot_outline_tags)))
             else:
                 say("  ⚠ Câu đầu bài hiện trước quá ngắn, bỏ qua đếm ngược")
 
