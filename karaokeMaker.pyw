@@ -51,6 +51,7 @@ FAST_RATE = 5.5         # trên mức này là câu nhanh
 LAYOUT_CENTER = "Căn giữa"
 LAYOUT_SPLIT = "Hai bên"
 VIDEO_FPS = 25
+VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".gif")   # nền là video thì lặp theo độ dài audio
 PREVIEW_SIZE = (480, 270)
 PREVIEW_BG = "0x202020"
 PREVIEW_DEBOUNCE_MS = 500
@@ -505,9 +506,14 @@ def browse_srt():
     if path:
         srt_var.set(path)
 
+def is_video_file(path):
+    return os.path.splitext(path)[1].lower() in VIDEO_EXTS
+
 def browse_bg():
     path = filedialog.askopenfilename(
-        filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")]
+        filetypes=[("Image/Video files", "*.png *.jpg *.jpeg *.bmp *.webp "
+                    "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.gif"),
+                   ("All files", "*.*")]
     )
     if path:
         bg_var.set(path)
@@ -622,13 +628,13 @@ def render_preview(srt_path, cue_no, bpm, font, size, res_x, res_y, style, bg_pa
         # setpts đẩy khung hình duy nhất tới thời điểm t để libass vẽ đúng câu đang hát;
         # settb 1/1000 vì time base mặc định 1/1 làm tròn t xuống giây nguyên
         if bg_path:
-            src = ["-loop", "1", "-framerate", "1", "-i", bg_path]
+            src = ["-i", bg_path] if is_video_file(bg_path) else ["-loop", "1", "-framerate", "1", "-i", bg_path]
             fit = "scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d," % (PREVIEW_SIZE * 2)
         else:
             src = ["-f", "lavfi", "-i", "color=c=%s:s=%dx%d:r=1:d=1" % (PREVIEW_BG, *PREVIEW_SIZE)]
             fit = ""
         cmd = ["ffmpeg", "-v", "error", "-y", *src,
-               "-vf", "%ssettb=1/1000,setpts=PTS+%.3f/TB,subtitles=preview.ass" % (fit, t),
+               "-vf", "%ssettb=1/1000,setpts=PTS-STARTPTS+%.3f/TB,subtitles=preview.ass" % (fit, t),
                "-frames:v", "1", "preview.png"]
         r = subprocess.run(cmd, cwd=work, capture_output=True, text=True, errors="replace",
                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
@@ -684,7 +690,10 @@ def audio_duration(path):
         return None
 
 def render_video(ass, audio_path, bg_path, out_path, res_x, res_y):
-    """ASS + audio (+ ảnh nền) → mp4 bằng ffmpeg; tiến độ chiếm đoạn 60→100%. True nếu thành công."""
+    """ASS + audio (+ ảnh/video nền) → mp4 bằng ffmpeg; tiến độ chiếm đoạn 60→100%. True nếu thành công.
+
+    Video nền được lặp vô hạn rồi cắt theo độ dài audio (-shortest), tiếng gốc của video bị bỏ.
+    """
     global current_process
 
     work = os.path.join(tempfile.gettempdir(), "karaokeMakerVideo")
@@ -692,20 +701,26 @@ def render_video(ass, audio_path, bg_path, out_path, res_x, res_y):
     with open(os.path.join(work, "karaoke.ass"), "w", encoding="utf-8") as f:
         f.write(ass)
 
-    if bg_path:
+    fit = "scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d" % (res_x, res_y, res_x, res_y)
+    if bg_path and is_video_file(bg_path):
+        src = ["-stream_loop", "-1", "-i", bg_path]
+        # fps + PTS-STARTPTS: chuẩn hóa tốc độ khung hình và đưa mốc thời gian về 0 để ASS không bị lệch
+        vf = "fps=%d,setpts=PTS-STARTPTS,%s,subtitles=karaoke.ass" % (VIDEO_FPS, fit)
+    elif bg_path:
         src = ["-loop", "1", "-framerate", str(VIDEO_FPS), "-i", bg_path]
-        vf = "scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,subtitles=karaoke.ass" % (
-            res_x, res_y, res_x, res_y)
+        vf = "%s,subtitles=karaoke.ass" % fit
     else:
         src = ["-f", "lavfi", "-i", "color=c=%s:s=%dx%d:r=%d" % (PREVIEW_BG, res_x, res_y, VIDEO_FPS)]
         vf = "subtitles=karaoke.ass"
+    duration = audio_duration(audio_path)
+    # -shortest một mình để dư đuôi hình 1-2s không có tiếng (nền lặp/vô hạn), nên cắt đúng theo audio
+    limit = ["-t", "%.3f" % duration] if duration else []
     # subtitles chạy với cwd=work để khỏi phải escape đường dẫn Windows trong filter
     cmd = ["ffmpeg", "-v", "error", "-y", "-progress", "pipe:1", "-nostats", *src, "-i", audio_path,
            "-map", "0:v", "-map", "1:a", "-vf", vf,
            "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
-           "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", out_path]
+           "-c:a", "aac", "-b:a", "192k", "-shortest", *limit, "-movflags", "+faststart", out_path]
 
-    duration = audio_duration(audio_path)
     proc = subprocess.Popen(cmd, cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, errors="replace",
                             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
@@ -864,7 +879,7 @@ if __name__ == "__main__":
     ttk.Button(audio_frame, text="Xóa", command=lambda: audio_var.set("")).pack(side=tk.LEFT, padx=(5, 0))
 
     # Background (chỉ dùng khi tạo video)
-    ttk.Label(left, text="Hình nền video (tùy chọn, không chọn = nền màu tối):").pack(anchor="w")
+    ttk.Label(left, text="Ảnh/video nền (tùy chọn, không chọn = nền màu tối; video ngắn hơn nhạc sẽ được lặp):").pack(anchor="w")
     bg_var = tk.StringVar()
     bg_frame = ttk.Frame(left)
     bg_frame.pack(fill=tk.X, pady=5)
