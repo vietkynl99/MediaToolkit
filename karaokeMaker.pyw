@@ -4,9 +4,10 @@ import sys
 import subprocess
 import threading
 import queue
+import tempfile
 import unicodedata
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import colorchooser, filedialog, messagebox
 from tkinter import ttk
 
 try:
@@ -47,6 +48,17 @@ DEFAULT_GAP_LONG = 4.0 # nghỉ giữa 2 câu dài hơn mức này thì tách nh
 LINGER = 0.5            # câu còn lại sau khi hát xong (giây)
 SLOW_RATE = 2.5         # âm tiết/giây: dưới mức này là câu chậm
 FAST_RATE = 5.5         # trên mức này là câu nhanh
+
+PREVIEW_SIZE = (640, 360)
+PREVIEW_BG = "0x202020"
+PREVIEW_DEBOUNCE_MS = 500
+PREVIEW_SAMPLE = [(0.0, 3.0, "Đây là dòng lời bài hát thứ nhất"),
+                  (3.0, 6.0, "Dòng thứ hai hiện ở bên dưới")]
+# outline/outline_w là viền chữ chưa hát, *_sung là viền chữ đã hát.
+# outline_w=None: tự theo cỡ chữ; outline_w_sung=None: giống chưa hát.
+DEFAULT_STYLE = {"primary": "#0000FF", "secondary": "#FFFFFF",
+                 "outline": "#001030", "outline_sung": "#FFFFFF",
+                 "outline_w": None, "outline_w_sung": None}
 
 PUNCT = ",;:.!?…-–—"
 TIME_RE = re.compile(
@@ -265,8 +277,30 @@ def ass_time(t):
     cs = int(round(max(t, 0) * 100))
     return "%d:%02d:%02d.%02d" % (cs // 360000, cs // 6000 % 60, cs // 100 % 60, cs % 100)
 
-def karaoke_text(spans, line_start):
-    """Chuỗi \\k: ranh giới làm tròn theo thời điểm tuyệt đối nên không bị lệch tích lũy."""
+def ass_colour(rgb):
+    """'#RRGGBB' → '&H00BBGGRR'."""
+    h = rgb.lstrip("#")
+    return "&H00%s%s%s" % (h[4:6], h[2:4], h[0:2])
+
+def split_graphemes(word):
+    """Tách theo ký tự, dấu kết hợp (chữ Việt dạng NFD) đi cùng ký tự đứng trước."""
+    out = []
+    for c in word:
+        if out and unicodedata.combining(c):
+            out[-1] += c
+        else:
+            out.append(c)
+    return out
+
+def karaoke_text(spans, line_start, outline_tags=None):
+    """Chuỗi \\k: ranh giới làm tròn theo thời điểm tuyệt đối nên không bị lệch tích lũy.
+
+    outline_tags = (chưa hát, đã hát), vd ("\\3c&H..&\\bord3", "\\3c&H..&\\bord6"): \\k không đổi được
+    màu viền nên dùng \\t chuyển dần sang viền đã hát trong đúng khoảng từ đó được tô. Tag trong
+    ASS có hiệu lực đến hết dòng nên mỗi từ phải đặt lại viền chưa hát trước khi \\t, nếu không
+    các từ sau thừa hưởng viền đã hát của từ trước. \\t nội suy đều cho cả từ chứ không chạy theo
+    \\kf, nên khi có viền riêng mỗi từ được chia thành từng ký tự để viền đổi theo từng ký tự một.
+    """
     base = int(round(line_start * 100))
     pos = base
     parts = []
@@ -277,9 +311,19 @@ def karaoke_text(spans, line_start):
             parts.append("{\\k%d}" % (a - pos))
             pos = a
         dur = max(b - pos, 1)
-        tag = "\\kf" if dur / 100.0 >= SHORT_WORD else "\\k"
         sep = " " if i < len(spans) - 1 else ""
-        parts.append("{%s%d}%s%s" % (tag, dur, word, sep))
+        if not outline_tags:
+            tag = "\\kf" if dur / 100.0 >= SHORT_WORD else "\\k"
+            parts.append("{%s%d}%s%s" % (tag, dur, word, sep))
+            pos += dur
+            continue
+        chars = split_graphemes(word)
+        for k, ch in enumerate(chars):
+            c0 = pos + round(dur * k / len(chars))
+            c1 = pos + round(dur * (k + 1) / len(chars))
+            parts.append("{\\kf%d%s\\t(%d,%d,%s)}%s%s" % (
+                c1 - c0, outline_tags[0], (c0 - base) * 10, (c1 - base) * 10, outline_tags[1],
+                ch, sep if k == len(chars) - 1 else ""))
         pos += dur
     return "".join(parts)
 
@@ -295,7 +339,7 @@ def countdown_text(t0, lit, t_end):
     return "".join(parts)
 
 def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_IN, gap_long=DEFAULT_GAP_LONG,
-              verse_lead=None, countdown=True, phase_at=None):
+              verse_lead=None, countdown=True, phase_at=None, style=DEFAULT_STYLE, say=log):
     """verse_lead=None: tự tính = thời gian đếm ngược + thời gian đọc.
 
     Mỗi chấm dài số nhịp nguyên nhỏ nhất sao cho >= MIN_DOT_INTERVAL.
@@ -309,11 +353,19 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
     if verse_lead is None:
         verse_lead = min(max(COUNTDOWN_BEATS * dot_step + VERSE_READ_TIME, VERSE_LEAD_RANGE[0]),
                          VERSE_LEAD_RANGE[1])
-        log("Hiện trước đầu đoạn: %.1fs (%d chấm x %.2fs + %.1fs đọc)" % (
+        say("Hiện trước đầu đoạn: %.1fs (%d chấm x %.2fs + %.1fs đọc)" % (
             verse_lead, COUNTDOWN_BEATS, dot_step, VERSE_READ_TIME))
     elif countdown:
-        log("Đếm ngược: mỗi chấm %d nhịp = %.2fs" % (dot_beats, dot_step))
+        say("Đếm ngược: mỗi chấm %d nhịp = %.2fs" % (dot_beats, dot_step))
     dot_size = int(size * 0.7)
+    primary, secondary, outline = (ass_colour(style[k]) for k in ("primary", "secondary", "outline"))
+    outline_w = style["outline_w"] or max(size // 16, 2)
+    outline_sung = ass_colour(style["outline_sung"])
+    outline_w_sung = style["outline_w_sung"] if style["outline_w_sung"] is not None else outline_w
+    outline_tags = None
+    if (outline_sung, outline_w_sung) != (outline, outline_w):
+        outline_tags = ("\\3c%s\\bord%d" % (outline, outline_w),
+                        "\\3c%s\\bord%d" % (outline_sung, outline_w_sung))
 
     header = (
         "[Script Info]\n"
@@ -327,12 +379,12 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
         "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
         # Primary = màu đã hát, Secondary = màu chưa hát
-        f"Style: Bottom,{font},{size},&H0000E6FF,&H00FFFFFF,&H00301000,&H80000000,"
-        f"-1,0,0,0,100,100,0,0,1,{max(size // 16, 2)},1,2,60,60,{margin},1\n"
-        f"Style: Top,{font},{size},&H0000E6FF,&H00FFFFFF,&H00301000,&H80000000,"
-        f"-1,0,0,0,100,100,0,0,1,{max(size // 16, 2)},1,2,60,60,{margin + gap},1\n"
+        f"Style: Bottom,{font},{size},{primary},{secondary},{outline},&H80000000,"
+        f"-1,0,0,0,100,100,0,0,1,{outline_w},1,2,60,60,{margin},1\n"
+        f"Style: Top,{font},{size},{primary},{secondary},{outline},&H80000000,"
+        f"-1,0,0,0,100,100,0,0,1,{outline_w},1,2,60,60,{margin + gap},1\n"
         # đếm ngược nằm phía trên dòng trên cùng
-        f"Style: Count,{font},{dot_size},&H0000E6FF,&H00FFFFFF,&H00301000,&H80000000,"
+        f"Style: Count,{font},{dot_size},{primary},{secondary},{outline},&H80000000,"
         f"-1,0,0,0,100,100,0,0,1,{max(dot_size // 16, 2)},1,2,60,60,{margin + 2 * gap},1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
@@ -361,7 +413,7 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
             pool = verse_syl[-4:] or all_syl[-4:]
             if pool:   # theo tempo các câu liền trước thay vì chỉ theo BPM
                 syl = max(float(np.median(pool)), MIN_SYLLABLE)
-                log("  ↳ câu cuối đoạn [%s]: theo tempo các câu trước (%.2fs/âm tiết)" % (ass_time(start), syl))
+                say("  ↳ câu cuối đoạn [%s]: theo tempo các câu trước (%.2fs/âm tiết)" % (ass_time(start), syl))
 
         sing_end, spans, rate = plan_line(start, window, words, syl, tail)
         observed = (sing_end - start) / (n_syl + LAST_WORD_STRETCH - 1)
@@ -416,10 +468,10 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
 
         style = "Top" if slots[i] == 0 else "Bottom"
         # karaoke_text tự thêm \k chờ từ lúc hiện đến lúc bắt đầu hát
-        body = "{\\fad(%d,%d)}%s" % (fade[0], fade[1], karaoke_text(spans, show))
+        body = "{\\fad(%d,%d)}%s" % (fade[0], fade[1], karaoke_text(spans, show, outline_tags))
         events.append("Dialogue: 0,%s,%s,%s,,0,0,0,,%s" % (
             ass_time(show), ass_time(hide), style, body))
-        log("  [%s] %.1f âm tiết/s (%s) %s" % (ass_time(start), rate, speed, text))
+        say("  [%s] %.1f âm tiết/s (%s) %s" % (ass_time(start), rate, speed, text))
 
         if countdown and i == 0:    # chỉ đếm ngược ở câu đầu bài, sau khoảng nghỉ không hiện lại
             last = start    # chấm cuối sáng đúng lúc bắt đầu hát, hoặc phách gần nhất nếu dò được
@@ -435,7 +487,7 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
                     ass_time(t0), ass_time(t_end),
                     "{\\fad(150,150)}" + countdown_text(t0, lit, t_end)))
             else:
-                log("  ⚠ Câu đầu bài hiện trước quá ngắn, bỏ qua đếm ngược")
+                say("  ⚠ Câu đầu bài hiện trước quá ngắn, bỏ qua đếm ngược")
 
     return header + "\n".join(events) + "\n"
 
@@ -467,12 +519,21 @@ def process_queues():
         kind, payload = result_queue.get()
         if kind == "bpm":
             bpm_var.set("%.1f" % payload)
+        elif kind == "preview":
+            global preview_img, preview_dirty
+            preview_btn.config(state=tk.NORMAL)
+            if payload:
+                preview_img = tk.PhotoImage(file=payload)
+                preview_label.config(image=preview_img, text="")
+            if preview_dirty:   # thông số đổi trong lúc đang vẽ
+                preview_dirty = False
+                start_preview(silent=True)
         elif kind == "done":
             start_btn.config(state=tk.NORMAL)
             stop_btn.config(state=tk.DISABLED)
     root.after(100, process_queues)
 
-def generate_ass(srt_path, audio_path, bpm, snap, font, size, res_x, res_y, countdown):
+def generate_ass(srt_path, audio_path, bpm, snap, font, size, res_x, res_y, countdown, style):
     """SRT (+ audio) → nội dung ASS. Trả về None nếu không tạo được."""
     cues = parse_srt(srt_path)
     if not cues:
@@ -511,7 +572,99 @@ def generate_ass(srt_path, audio_path, bpm, snap, font, size, res_x, res_y, coun
         phase_at = lambda t: beat_grid_phase(flux, beat, t)
         log("Canh chấm đếm ngược theo phách của audio")
     return build_ass(cues, bpm, onsets, font, size, res_x, res_y,
-                     countdown=countdown, phase_at=phase_at)
+                     countdown=countdown, phase_at=phase_at, style=style)
+
+def read_style():
+    """Đọc ở luồng chính; ValueError nếu độ dày viền không phải số nguyên."""
+    ow = outline_w_var.get().strip()
+    ow_sung = outline_w_sung_var.get().strip()
+    return {"primary": primary_var.get(), "secondary": secondary_var.get(),
+            "outline": outline_var.get(), "outline_sung": outline_sung_var.get(),
+            "outline_w": int(ow) if ow else None,
+            "outline_w_sung": int(ow_sung) if ow_sung else None}
+
+def pick_color(var, btn):
+    rgb = colorchooser.askcolor(color=var.get(), parent=root)[1]
+    if rgb:
+        var.set(rgb)
+        btn.config(bg=rgb, activebackground=rgb)
+
+def render_preview(srt_path, cue_no, bpm, font, size, res_x, res_y, style):
+    """Vẽ một khung hình bằng ffmpeg (libass) rồi báo đường dẫn PNG về luồng chính."""
+    png = None
+    try:
+        cues = parse_srt(srt_path) if srt_path else PREVIEW_SAMPLE
+        if not cues:
+            log("✖ SRT không có câu nào")
+            return
+        i = min(max(cue_no, 1), len(cues)) - 1
+        lo = max(i - 1, 0)
+        sub = cues[lo:i + 2]    # câu trước để thấy bố cục 2 dòng
+        p = i - lo
+        start, end, _ = sub[p]
+        dur = end - start if end > start else 2.0
+        if p + 1 < len(sub):
+            dur = min(dur, sub[p + 1][0] - start)
+        t = start + 0.5 * dur
+
+        work = os.path.join(tempfile.gettempdir(), "karaokeMakerPreview")
+        os.makedirs(work, exist_ok=True)
+        with open(os.path.join(work, "preview.ass"), "w", encoding="utf-8") as f:
+            f.write(build_ass(sub, bpm or DEFAULT_BPM, None, font, size, res_x, res_y,
+                              countdown=False, style=style, say=lambda *_: None))
+
+        # setpts đẩy khung hình duy nhất tới thời điểm t để libass vẽ đúng câu đang hát;
+        # settb 1/1000 vì time base mặc định 1/1 làm tròn t xuống giây nguyên
+        cmd = ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+               "-i", "color=c=%s:s=%dx%d:r=1:d=1" % (PREVIEW_BG, *PREVIEW_SIZE),
+               "-vf", "settb=1/1000,setpts=PTS+%.3f/TB,subtitles=preview.ass" % t,
+               "-frames:v", "1", "preview.png"]
+        r = subprocess.run(cmd, cwd=work, capture_output=True, text=True, errors="replace",
+                           creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        if r.returncode != 0:
+            log("✖ Preview lỗi: " + r.stderr.strip()[-300:])
+            return
+        png = os.path.join(work, "preview.png")
+    except Exception as e:
+        log(f"✖ Preview lỗi: {e}")
+    finally:
+        result_queue.put(("preview", png))
+
+def schedule_preview(*_):
+    """Gộp các thay đổi liên tiếp (gõ số, kéo spinbox) thành một lần vẽ."""
+    global preview_timer
+    if preview_timer:
+        root.after_cancel(preview_timer)
+    preview_timer = root.after(PREVIEW_DEBOUNCE_MS, lambda: start_preview(silent=True))
+
+def start_preview(silent=False):
+    global preview_dirty, preview_timer
+    preview_timer = None
+    if str(preview_btn.cget("state")) == "disabled":
+        preview_dirty = True
+        return
+    try:
+        bpm_text = bpm_var.get().strip()
+        bpm = float(bpm_text) if bpm_text else None
+        size = int(size_var.get())
+        res_y = int(res_var.get())
+        cue_no = int(cue_var.get())
+        style = read_style()
+    except ValueError:
+        if not silent:   # đang gõ dở thì im lặng, chờ giá trị hợp lệ
+            messagebox.showerror("Error", "BPM, cỡ chữ, độ phân giải, độ dày viền hoặc số câu không hợp lệ")
+        return
+    if bpm is not None and bpm <= 0:
+        if not silent:
+            messagebox.showerror("Error", "BPM phải lớn hơn 0")
+        return
+
+    preview_btn.config(state=tk.DISABLED)
+    threading.Thread(
+        target=render_preview,
+        args=(srt_var.get(), cue_no, bpm, font_var.get().strip() or "Arial", size,
+              res_y * 16 // 9, res_y, style),
+        daemon=True).start()
 
 def start_make():
     global is_running
@@ -530,8 +683,9 @@ def start_make():
         bpm = float(bpm_text) if bpm_text else None
         size = int(size_var.get())
         res_y = int(res_var.get())
+        style = read_style()
     except ValueError:
-        messagebox.showerror("Error", "BPM, cỡ chữ hoặc độ phân giải không hợp lệ")
+        messagebox.showerror("Error", "BPM, cỡ chữ, độ phân giải hoặc độ dày viền không hợp lệ")
         return
     if bpm is not None and bpm <= 0:
         messagebox.showerror("Error", "BPM phải lớn hơn 0")
@@ -555,7 +709,7 @@ def start_make():
 
         try:
             ass = generate_ass(srt_path, audio_path, bpm, snap, font, size, res_x, res_y,
-                              countdown)
+                              countdown, style)
             if ass:
                 out_path = os.path.splitext(srt_path)[0] + ".ass"
                 with open(out_path, "w", encoding="utf-8") as f:
@@ -591,7 +745,7 @@ def stop_make():
 if __name__ == "__main__":
     root = tk.Tk()
     root.title("Karaoke Maker (SRT → ASS)")
-    root.geometry("850x720")
+    root.geometry("850x960")
 
     if np is None:
         root.withdraw()
@@ -638,9 +792,53 @@ if __name__ == "__main__":
     ttk.Label(opt_frame, text="Cao video:").grid(row=1, column=4, sticky="w", padx=5)
     ttk.Spinbox(opt_frame, from_=360, to=2160, increment=360, textvariable=res_var, width=8).grid(row=1, column=5, padx=5)
 
+    primary_var = tk.StringVar(value=DEFAULT_STYLE["primary"])
+    secondary_var = tk.StringVar(value=DEFAULT_STYLE["secondary"])
+    outline_var = tk.StringVar(value=DEFAULT_STYLE["outline"])
+    outline_sung_var = tk.StringVar(value=DEFAULT_STYLE["outline_sung"])
+    outline_w_var = tk.StringVar()
+    outline_w_sung_var = tk.StringVar()
+    color_rows = [
+        (2, [("Màu chữ đã hát:", primary_var), ("Màu chữ chưa hát:", secondary_var)]),
+        (3, [("Màu viền đã hát:", outline_sung_var), ("Màu viền chưa hát:", outline_var)]),
+    ]
+    for row, items in color_rows:
+        for col, (label, var) in enumerate(items):
+            ttk.Label(opt_frame, text=label).grid(row=row, column=col * 2, sticky="w", padx=5)
+            btn = tk.Button(opt_frame, width=9, text="", bg=var.get(), activebackground=var.get())
+            btn.config(command=lambda v=var, b=btn: pick_color(v, b))
+            btn.grid(row=row, column=col * 2 + 1, padx=5, pady=3)
+
+    ttk.Label(opt_frame, text="Viền đã hát:").grid(row=4, column=0, sticky="w", padx=5)
+    ttk.Spinbox(opt_frame, from_=0, to=30, textvariable=outline_w_sung_var, width=8).grid(row=4, column=1, padx=5)
+    ttk.Label(opt_frame, text="Viền chưa hát:").grid(row=4, column=2, sticky="w", padx=5)
+    ttk.Spinbox(opt_frame, from_=0, to=30, textvariable=outline_w_var, width=8).grid(row=4, column=3, padx=5)
+    ttk.Label(opt_frame, text="(độ dày chưa hát để trống = tự theo cỡ chữ; đã hát để trống = giống chưa hát)").grid(
+        row=5, column=0, columnspan=6, sticky="w", padx=5)
+
     countdown_var = tk.BooleanVar(value=True)
     ttk.Checkbutton(opt_frame, text="Đếm ngược 4 chấm theo nhịp ở đầu bài", variable=countdown_var).grid(
-        row=2, column=0, columnspan=4, sticky="w", padx=5, pady=(5, 5))
+        row=6, column=0, columnspan=4, sticky="w", padx=5, pady=(5, 5))
+
+    # Preview
+    preview_frame = ttk.Frame(frame)
+    preview_frame.pack(fill=tk.X, pady=5)
+    cue_var = tk.StringVar(value="1")
+    ttk.Label(preview_frame, text="Xem trước câu số:").pack(side=tk.LEFT, padx=5)
+    ttk.Spinbox(preview_frame, from_=1, to=9999, textvariable=cue_var, width=6).pack(side=tk.LEFT)
+    preview_btn = ttk.Button(preview_frame, text="Xem trước", command=start_preview)
+    preview_btn.pack(side=tk.LEFT, padx=10)
+    ttk.Label(preview_frame, text="(không chọn SRT thì dùng câu mẫu; cần ffmpeg có libass)").pack(side=tk.LEFT)
+    preview_img = None
+    preview_dirty = False
+    preview_timer = None
+    preview_label = ttk.Label(frame, text="(chưa có preview)", anchor="center")
+    preview_label.pack(pady=5)
+    for v in (srt_var, font_var, size_var, res_var, bpm_var, cue_var,
+              primary_var, secondary_var, outline_var, outline_sung_var,
+              outline_w_var, outline_w_sung_var):
+        v.trace_add("write", schedule_preview)
+    schedule_preview()
 
     # Progress
     progress_var = tk.DoubleVar()
@@ -660,7 +858,7 @@ if __name__ == "__main__":
     # Log box
     ttk.Label(frame, text="Log:").pack(anchor="w")
 
-    log_text = tk.Text(frame, height=10)
+    log_text = tk.Text(frame, height=6)
     log_text.pack(fill=tk.BOTH, expand=True, pady=5)
 
     # Start log polling
