@@ -30,7 +30,8 @@ MAX_STRETCH = 2.0      # thời lượng hát tối đa so với ước lượng
 LAST_WORD_STRETCH = 1.5 # từ cuối câu thường ngân dài hơn
 PAUSE_WEIGHT = 0.6      # khoảng nghỉ sau dấu câu (tính theo âm tiết)
 TAIL_NO_NEXT = 1.0      # câu cuối: cửa sổ hát tối thiểu thêm sau âm tiết cuối
-MIN_WORD = 0.06         # từ ngắn nhất sau khi snap (giây)
+END_TOLERANCE = 0.3     # dung sai cộng thêm vào mốc end của SRT (giây)
+MIN_WORD = 0.06        # từ ngắn nhất sau khi snap (giây)
 SNAP_RATIO = 0.35       # snap onset trong +-35% độ dài âm tiết trung bình
 SHORT_WORD = 0.15       # từ ngắn hơn mức này dùng \k thay vì \kf
 
@@ -294,7 +295,7 @@ def countdown_text(t0, lit, t_end):
     return "".join(parts)
 
 def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_IN, gap_long=DEFAULT_GAP_LONG,
-              verse_lead=None, countdown=True, phase_at=None):
+              verse_lead=None, countdown=True, phase_at=None, use_end=False):
     """verse_lead=None: tự tính = thời gian đếm ngược + thời gian đọc.
 
     Mỗi chấm dài số nhịp nguyên nhỏ nhất sao cho >= MIN_DOT_INTERVAL.
@@ -346,6 +347,9 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
         n_syl = sum(w[1] for w in words)
         if i + 1 < len(cues):
             window = cues[i + 1][0] - start
+            # end của SRT hay bị kéo dài/chồng câu sau: chỉ tin khi nằm trong (start, start câu sau]
+            if use_end and start < end <= cues[i + 1][0]:
+                window = min(window, max(end - start, n_syl * bpm_syl) + END_TOLERANCE)
         else:
             window = max(end - start, n_syl * bpm_syl + TAIL_NO_NEXT)
         window = max(window, 0.3)
@@ -469,7 +473,7 @@ def process_queues():
     root.after(100, process_queues)
 
 def generate_ass(srt_path, audio_path, bpm, snap, font, size, res_x, res_y, lead_in, gap_long, verse_lead,
-                 countdown):
+                 countdown, use_end=False):
     """SRT (+ audio) → nội dung ASS. Trả về None nếu không tạo được."""
     cues = parse_srt(srt_path)
     if not cues:
@@ -508,7 +512,7 @@ def generate_ass(srt_path, audio_path, bpm, snap, font, size, res_x, res_y, lead
         phase_at = lambda t: beat_grid_phase(flux, beat, t)
         log("Canh chấm đếm ngược theo phách của audio")
     return build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in, gap_long, verse_lead,
-                     countdown, phase_at)
+                     countdown, phase_at, use_end)
 
 def start_make():
     global is_running
@@ -544,6 +548,7 @@ def start_make():
     font = font_var.get().strip() or "Arial"
     snap = snap_var.get() and bool(audio_path)
     countdown = countdown_var.get()   # đọc ở luồng chính, luồng nền không được đụng biến Tk
+    use_end = use_end_var.get()
     res_x = res_y * 16 // 9
 
     progress_var.set(0)
@@ -559,7 +564,7 @@ def start_make():
 
         try:
             ass = generate_ass(srt_path, audio_path, bpm, snap, font, size, res_x, res_y,
-                              lead_in, gap_long, verse_lead, countdown)
+                              lead_in, gap_long, verse_lead, countdown, use_end)
             if ass:
                 out_path = os.path.splitext(srt_path)[0] + ".ass"
                 with open(out_path, "w", encoding="utf-8") as f:
@@ -606,7 +611,7 @@ if __name__ == "__main__":
     frame.pack(fill=tk.BOTH, expand=True)
 
     # SRT select
-    ttk.Label(frame, text="File SRT (mốc bắt đầu từng câu):").pack(anchor="w")
+    ttk.Label(frame, text="File SRT (mốc từng câu):").pack(anchor="w")
     srt_var = tk.StringVar()
     srt_frame = ttk.Frame(frame)
     srt_frame.pack(fill=tk.X, pady=5)
@@ -645,6 +650,9 @@ if __name__ == "__main__":
 
     ttk.Checkbutton(opt_frame, text="Snap ranh giới từ vào onset của audio", variable=snap_var).grid(
         row=2, column=0, columnspan=4, sticky="w", padx=5)
+    use_end_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(opt_frame, text="Dùng mốc kết thúc của SRT", variable=use_end_var).grid(
+        row=2, column=4, columnspan=2, sticky="w", padx=5)
 
     lead_var = tk.StringVar(value=str(DEFAULT_LEAD_IN))
     gap_var = tk.StringVar(value=str(DEFAULT_GAP_LONG))
