@@ -20,8 +20,7 @@ SR = 22050              # sample rate dùng để phân tích audio
 N_FFT = 1024
 HOP = 256
 CHUNK = 1000           # số frame xử lý mỗi lượt (tiết kiệm RAM)
-DEFAULT_BPM = 120       # dùng khi không có BPM và không có audio
-BPM_RANGE = (70, 160)   # dải chọn nhịp chính khi tự đo
+PREVIEW_BPM = 120       # preview khi chưa nhập BPM
 
 SYLLABLE_BEATS = 0.5    # 1 âm tiết ~ 1 móc đơn (nửa beat)
 MIN_FILL = 0.60         # thời lượng hát tối thiểu so với khoảng tới câu kế
@@ -172,22 +171,6 @@ def onset_envelope(x):
         out.append(np.maximum(np.diff(m, axis=0), 0).sum(axis=1))
         prev = mag[-1]
     return np.concatenate(out)
-
-def estimate_bpm(flux, lo, hi):
-    """Chấm điểm từng BPM bằng phổ của onset (cơ bản + hài bậc 2, 3)."""
-    fps = SR / HOP
-    flux = flux - flux.mean()
-    flux = flux * np.hanning(len(flux))
-
-    nfft = 1 << int(np.ceil(np.log2(len(flux) * 16)))
-    spec = np.abs(np.fft.rfft(flux, nfft))
-    axis = np.arange(len(spec)) * fps / nfft * 60
-
-    def score(b):
-        return sum(np.interp(k * b, axis, spec) / k ** 0.5 for k in (1, 2, 3))
-
-    grid = np.arange(lo, hi, 0.01)
-    return float(grid[np.argmax(score(grid))])
 
 def pick_onsets(flux):
     """Thời điểm (giây) các đỉnh onset nổi bật."""
@@ -517,9 +500,7 @@ def process_queues():
         progress_var.set(progress_queue.get())
     while not result_queue.empty():
         kind, payload = result_queue.get()
-        if kind == "bpm":
-            bpm_var.set("%.1f" % payload)
-        elif kind == "preview":
+        if kind == "preview":
             global preview_img, preview_dirty
             preview_btn.config(state=tk.NORMAL)
             if payload:
@@ -543,7 +524,7 @@ def generate_ass(srt_path, audio_path, bpm, snap, font, size, res_x, res_y, coun
 
     onsets = None
     flux = None
-    if audio_path and (bpm is None or snap or countdown):
+    if audio_path and (snap or countdown):
         log("Đang phân tích audio...")
         x = decode_audio(audio_path)
         if x is None:
@@ -551,17 +532,9 @@ def generate_ass(srt_path, audio_path, bpm, snap, font, size, res_x, res_y, coun
         elif is_running:
             progress_queue.put(30)
             flux = onset_envelope(x)
-            if bpm is None:
-                bpm = estimate_bpm(flux, *BPM_RANGE)
-                log(f"BPM tự đo: {bpm:.1f}")
-                result_queue.put(("bpm", bpm))
             if snap:
                 onsets = pick_onsets(flux)
                 log(f"Tìm thấy {len(onsets)} onset để snap")
-
-    if bpm is None:
-        bpm = DEFAULT_BPM
-        log(f"Không có BPM/audio, dùng mặc định {DEFAULT_BPM}")
 
     if not is_running:
         return None
@@ -610,7 +583,7 @@ def render_preview(srt_path, cue_no, bpm, font, size, res_x, res_y, style):
         work = os.path.join(tempfile.gettempdir(), "karaokeMakerPreview")
         os.makedirs(work, exist_ok=True)
         with open(os.path.join(work, "preview.ass"), "w", encoding="utf-8") as f:
-            f.write(build_ass(sub, bpm or DEFAULT_BPM, None, font, size, res_x, res_y,
+            f.write(build_ass(sub, bpm or PREVIEW_BPM, None, font, size, res_x, res_y,
                               countdown=False, style=style, say=lambda *_: None))
 
         # setpts đẩy khung hình duy nhất tới thời điểm t để libass vẽ đúng câu đang hát;
@@ -680,14 +653,17 @@ def start_make():
 
     try:
         bpm_text = bpm_var.get().strip()
-        bpm = float(bpm_text) if bpm_text else None
+        if not bpm_text:
+            messagebox.showerror("Error", "Chưa nhập BPM")
+            return
+        bpm = float(bpm_text)
         size = int(size_var.get())
         res_y = int(res_var.get())
         style = read_style()
     except ValueError:
         messagebox.showerror("Error", "BPM, cỡ chữ, độ phân giải hoặc độ dày viền không hợp lệ")
         return
-    if bpm is not None and bpm <= 0:
+    if bpm <= 0:
         messagebox.showerror("Error", "BPM phải lớn hơn 0")
         return
 
@@ -783,7 +759,7 @@ if __name__ == "__main__":
 
     ttk.Label(opt_frame, text="BPM:").grid(row=0, column=0, sticky="w", padx=5)
     ttk.Entry(opt_frame, textvariable=bpm_var, width=10).grid(row=0, column=1, padx=5)
-    ttk.Label(opt_frame, text="(để trống = tự đo từ audio, không có audio = 120)").grid(row=0, column=2, columnspan=3, sticky="w", padx=5)
+    ttk.Label(opt_frame, text="(bắt buộc; để trống thì preview tạm dùng 120)").grid(row=0, column=2, columnspan=3, sticky="w", padx=5)
 
     ttk.Label(opt_frame, text="Font:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
     ttk.Entry(opt_frame, textvariable=font_var, width=16).grid(row=1, column=1, padx=5)
