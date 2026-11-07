@@ -335,6 +335,98 @@ def countdown_text(t0, lit, t_end, outline_tags=None):
                                        "  " if j < len(lit) - 1 else ""))
     return "".join(parts)
 
+_gdi_fonts = {}                     # font -> (hdc, hfont), dùng chung giữa các lần dựng
+_gdi_lock = threading.Lock()
+
+def make_text_measurer(font, size):
+    """Đo độ rộng chữ đậm theo đơn vị PlayRes bằng GDI của Windows; None nếu không đo được.
+
+    Dùng để biết vị trí từng từ trên màn hình khi viền cần đổi màu đúng ranh giới \\kf. lfHeight
+    dương = chiều cao ô chữ, cùng nghĩa với Fontsize của ASS. Đo ở cỡ lớn rồi co lại để hinting
+    không làm tròn độ rộng. GDI không áp kerning như libass nên vài điểm ảnh có thể lệch.
+    """
+    if os.name != "nt":
+        return None
+    ref = 1000
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        gdi32 = ctypes.WinDLL("gdi32")
+
+        class SIZE(ctypes.Structure):
+            _fields_ = [("cx", ctypes.c_long), ("cy", ctypes.c_long)]
+
+        gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+        gdi32.CreateCompatibleDC.restype = wintypes.HDC
+        gdi32.CreateFontW.argtypes = [ctypes.c_int] * 5 + [wintypes.DWORD] * 8 + [wintypes.LPCWSTR]
+        gdi32.CreateFontW.restype = wintypes.HFONT
+        gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+        gdi32.SelectObject.restype = wintypes.HGDIOBJ
+        gdi32.GetTextExtentPoint32W.argtypes = [wintypes.HDC, wintypes.LPCWSTR, ctypes.c_int,
+                                                ctypes.POINTER(SIZE)]
+        gdi32.GetTextExtentPoint32W.restype = wintypes.BOOL
+
+        with _gdi_lock:
+            if font not in _gdi_fonts:
+                hdc = gdi32.CreateCompatibleDC(None)
+                hfont = gdi32.CreateFontW(ref, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 0, 0, font)
+                if not hdc or not hfont:
+                    return None
+                gdi32.SelectObject(hdc, hfont)
+                _gdi_fonts[font] = (hdc, hfont)
+            hdc = _gdi_fonts[font][0]
+
+        def measure(text):
+            sz = SIZE()
+            with _gdi_lock:
+                if not gdi32.GetTextExtentPoint32W(hdc, text, len(text), ctypes.byref(sz)):
+                    raise OSError("GetTextExtentPoint32W")
+            return sz.cx * size / ref
+
+        measure("A")    # thử một lần để lỗi lộ ra ở đây chứ không phải giữa lúc dựng
+        return measure
+    except Exception:
+        return None
+
+def line_edges(spans, measure, align, res_x, margin_l, margin_r):
+    """Tọa độ x các ranh giới từ của một câu: edges[k] là mép trái từ k, edges[k+1] là mép phải."""
+    segs = [w + (" " if i < len(spans) - 1 else "") for i, (w, _, _) in enumerate(spans)]
+    total = measure("".join(segs))
+    if align == 1:      # \\an1: căn trái
+        left = margin_l
+    elif align == 3:    # \\an3: căn phải
+        left = res_x - margin_r - total
+    else:               # \\an2: căn giữa giữa hai lề
+        left = margin_l + (res_x - margin_l - margin_r - total) / 2
+    edges, acc = [left], ""
+    for s in segs:
+        acc += s
+        edges.append(left + measure(acc))
+    return edges
+
+def sweep_clip_tags(kind, spans, line_start, edges, pad, height):
+    """Clip chạy cùng đường quét \\kf: phần bên trái ranh giới là chữ đã hát.
+
+    kind = "\\clip" (chỉ giữ phần đã hát) hoặc "\\iclip" (chỉ giữ phần chưa hát); hai lớp dùng cùng
+    ranh giới nên khớp nhau từng điểm ảnh. libass nội suy \\t của clip từ giá trị hiện tại nên chuỗi
+    \\t liên tiếp cộng dồn thành đường chạy liền. pad chừa chỗ cho viền nhô ra ngoài chữ đầu/cuối.
+    Thời gian lấy theo đúng cách karaoke_text chia từ để ranh giới khớp với \\kf.
+    """
+    base = int(round(line_start * 100))
+    pos = base
+    parts = ["%s(0,0,%d,%d)" % (kind, round(edges[0] - pad), height)]
+    for i, (word, t0, t1) in enumerate(spans):
+        a = int(round(t0 * 100))
+        b = int(round(t1 * 100))
+        pos = max(pos, a)
+        dur = max(b - pos, 1)
+        right = edges[i + 1] + (pad if i == len(spans) - 1 else 0)
+        parts.append("\\t(%d,%d,%s(0,0,%d,%d))" % ((pos - base) * 10, (pos + dur - base) * 10,
+                                                   kind, round(right), height))
+        pos += dur
+    return "".join(parts)
+
 def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_IN, gap_long=DEFAULT_GAP_LONG,
               verse_lead=None, countdown=True, phase_at=None, style=DEFAULT_STYLE, say=log):
     """verse_lead=None: tự tính = thời gian đếm ngược + thời gian đọc.
@@ -366,6 +458,10 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
     if (outline_sung, outline_w_sung) != (outline, outline_w):
         outline_tags = ("\\3c%s\\bord%d" % (outline, outline_w),
                         "\\3c%s\\bord%d" % (outline_sung, outline_w_sung))
+    # viền đổi màu theo đúng đường quét cần biết vị trí từng từ; không đo được thì đổi theo từng ký tự
+    measure = make_text_measurer(font, size) if outline_tags else None
+    if outline_tags and not measure:
+        say("⚠ Không đo được độ rộng chữ, viền sẽ đổi màu theo từng ký tự thay vì theo đường quét")
     dot_w = max(dot_size // 16, 2)
     dot_w_sung = dot_w if outline_w_sung == outline_w else max(round(outline_w_sung * dot_size / size), 1)
     dot_outline_tags = None
@@ -473,11 +569,25 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
         else:
             fade, speed = (200, 200), "vừa"
 
-        style = "Top" if slots[i] == 0 else "Bottom"
+        style_name = "Top" if slots[i] == 0 else "Bottom"
+        fad = "\\fad(%d,%d)" % (fade[0], fade[1])
         # karaoke_text tự thêm \k chờ từ lúc hiện đến lúc bắt đầu hát
-        body = "{\\fad(%d,%d)}%s" % (fade[0], fade[1], karaoke_text(spans, show, outline_tags))
-        events.append("Dialogue: 0,%s,%s,%s,,0,0,0,,%s" % (
-            ass_time(show), ass_time(hide), style, body))
+        if measure:
+            # lớp A: viền chưa hát, chỉ giữ phần phía sau đường quét; lớp B: viền đã hát, chỉ giữ
+            # phần phía trước. \kf không quét được viền nên ranh giới do clip chạy theo.
+            edges = line_edges(spans, measure, align_top if slots[i] == 0 else align_bottom,
+                               res_x, margin_l, margin_r)
+            pad = max(outline_w, outline_w_sung) + 2
+            text = karaoke_text(spans, show)
+            bodies = [
+                "{%s%s}%s" % (fad, sweep_clip_tags("\\iclip", spans, show, edges, pad, res_y), text),
+                "{%s%s%s}%s" % (fad, outline_tags[1], sweep_clip_tags("\\clip", spans, show, edges, pad, res_y), text),
+            ]
+        else:
+            bodies = ["{%s}%s" % (fad, karaoke_text(spans, show, outline_tags))]
+        for body in bodies:
+            events.append("Dialogue: 0,%s,%s,%s,,0,0,0,,%s" % (
+                ass_time(show), ass_time(hide), style_name, body))
         say("  [%s] %.1f âm tiết/s (%s) %s" % (ass_time(start), rate, speed, text))
 
         is_verse_start = i == 0 or groups[i] != groups[i - 1]   # đầu bài hoặc sau khoảng nghỉ dài
