@@ -20,6 +20,7 @@ CHUNK = 1000        # số frame xử lý mỗi lượt (tiết kiệm RAM)
 MIN_SECONDS = 8     # đoạn ngắn hơn thì không đủ dữ liệu để đo
 WINDOW_SECONDS = 12 # độ dài cửa sổ khi tính % ổn định
 TOLERANCE = 0.015   # sai lệch BPM cho phép giữa cửa sổ và kết quả chung
+RELATED_RATIOS = (1, 2, 0.5, 0.75, 4 / 3)  # tỉ lệ nhịp coi là cùng một nhịp
 
 # ================= GLOBAL STATE =================
 log_queue = queue.Queue()
@@ -111,7 +112,8 @@ def estimate_bpm(flux, lo, hi):
     return float(grid[np.argmax(sc)])
 
 def stability_percent(flux, bpm, lo, hi):
-    """% cửa sổ (12s, chồng 50%) có BPM trùng kết quả chung (sai lệch <= 1.5%)."""
+    """% cửa sổ (12s, chồng 50%) có BPM trùng kết quả chung (sai lệch <= 1.5%).
+    Cửa sổ lệch theo tỉ lệ nhịp đơn giản (x2, x1/2, x3/4, x4/3) vẫn tính là khớp."""
     fps = SR / HOP
     win = min(int(WINDOW_SECONDS * fps), len(flux) // 2)
     hop = max(win // 2, 1)
@@ -120,7 +122,7 @@ def stability_percent(flux, bpm, lo, hi):
     for s in range(0, len(flux) - win + 1, hop):
         b = estimate_bpm(flux[s:s + win], lo, hi)
         total += 1
-        if abs(b - bpm) / bpm <= TOLERANCE:
+        if any(abs(b - bpm * r) / (bpm * r) <= TOLERANCE for r in RELATED_RATIOS):
             agree += 1
     return 100.0 * agree / total if total else 0.0
 
