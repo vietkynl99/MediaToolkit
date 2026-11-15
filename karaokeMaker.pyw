@@ -1,3 +1,4 @@
+import math
 import os
 import re
 import sys
@@ -14,6 +15,11 @@ try:
     import numpy as np
 except ImportError:
     np = None
+
+try:
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
+except ImportError:
+    Image = None
 
 # ================= CONSTANTS =================
 SR = 22050              # sample rate dùng để phân tích audio
@@ -33,7 +39,6 @@ TAIL_NO_NEXT = 1.0      # câu cuối: cửa sổ hát tối thiểu thêm sau �
 END_TOLERANCE = 0.3     # dung sai cộng thêm vào mốc end của SRT (giây)
 MIN_WORD = 0.06        # từ ngắn nhất sau khi snap (giây)
 SNAP_RATIO = 0.35       # snap onset trong +-35% độ dài âm tiết trung bình
-SHORT_WORD = 0.15       # từ ngắn hơn mức này dùng \k thay vì \kf
 
 DEFAULT_LEAD_IN = 2.0   # lời hiện trước lúc hát tối thiểu bao lâu (giây)
 COUNTDOWN_BEATS = 4     # số chấm đếm ngược trước câu đầu bài và câu đầu tiên sau mỗi khoảng nghỉ dài
@@ -262,181 +267,23 @@ def snap_to_onsets(spans, onsets, sing_end, avg_syl):
         out.append((word, starts[i], max(end, starts[i] + MIN_WORD)))
     return out
 
-# ---------- ASS ----------
-def ass_time(t):
+# ---------- Plan (thời điểm hiện/ẩn, dòng trên/dưới, đếm ngược) ----------
+def fmt_time(t):
     cs = int(round(max(t, 0) * 100))
     return "%d:%02d:%02d.%02d" % (cs // 360000, cs // 6000 % 60, cs // 100 % 60, cs % 100)
 
-def ass_colour(rgb):
-    """'#RRGGBB' → '&H00BBGGRR'."""
-    h = rgb.lstrip("#")
-    return "&H00%s%s%s" % (h[4:6], h[2:4], h[0:2])
+def plan_karaoke(cues, bpm, onsets, lead_in=DEFAULT_LEAD_IN, gap_long=DEFAULT_GAP_LONG,
+                 verse_lead=None, countdown=True, phase_at=None, say=log):
+    """Lập thời gian hát và bố cục cho từng câu. Trả về (lines, dots).
 
-def split_graphemes(word):
-    """Tách theo ký tự, dấu kết hợp (chữ Việt dạng NFD) đi cùng ký tự đứng trước."""
-    out = []
-    for c in word:
-        if out and unicodedata.combining(c):
-            out[-1] += c
-        else:
-            out.append(c)
-    return out
+    lines: mỗi câu một dict {start, sing_end, spans, rate, text, slot, show, hide, fade_in, fade_out}
+    với slot 0 = dòng trên, 1 = dòng dưới. dots: mỗi lần đếm ngược một dict {t0, lit, t_end}.
 
-def karaoke_text(spans, line_start, outline_tags=None):
-    """Chuỗi \\k: ranh giới làm tròn theo thời điểm tuyệt đối nên không bị lệch tích lũy.
-
-    outline_tags = (chưa hát, đã hát), vd ("\\3c&H..&\\bord3", "\\3c&H..&\\bord6"): \\k không đổi được
-    màu viền nên dùng \\t chuyển dần sang viền đã hát trong đúng khoảng từ đó được tô. Tag trong
-    ASS có hiệu lực đến hết dòng nên mỗi từ phải đặt lại viền chưa hát trước khi \\t, nếu không
-    các từ sau thừa hưởng viền đã hát của từ trước. \\t nội suy đều cho cả từ chứ không chạy theo
-    \\kf, nên khi có viền riêng mỗi từ được chia thành từng ký tự để viền đổi theo từng ký tự một.
-    """
-    base = int(round(line_start * 100))
-    pos = base
-    parts = []
-    for i, (word, t0, t1) in enumerate(spans):
-        a = int(round(t0 * 100))
-        b = int(round(t1 * 100))
-        if a > pos:                       # khoảng nghỉ trước từ
-            parts.append("{\\k%d}" % (a - pos))
-            pos = a
-        dur = max(b - pos, 1)
-        sep = " " if i < len(spans) - 1 else ""
-        if not outline_tags:
-            tag = "\\kf" if dur / 100.0 >= SHORT_WORD else "\\k"
-            parts.append("{%s%d}%s%s" % (tag, dur, word, sep))
-            pos += dur
-            continue
-        chars = split_graphemes(word)
-        for k, ch in enumerate(chars):
-            c0 = pos + round(dur * k / len(chars))
-            c1 = pos + round(dur * (k + 1) / len(chars))
-            parts.append("{\\kf%d%s\\t(%d,%d,%s)}%s%s" % (
-                c1 - c0, outline_tags[0], (c0 - base) * 10, (c1 - base) * 10, outline_tags[1],
-                ch, sep if k == len(chars) - 1 else ""))
-        pos += dur
-    return "".join(parts)
-
-def countdown_text(t0, lit, t_end, outline_tags=None):
-    """Các chấm hiện trắng từ t0, chấm thứ j sáng lên tại lit[j], chấm cuối sáng đến t_end.
-
-    outline_tags = (chưa sáng, đã sáng): chấm sáng lên thì viền đổi theo như chữ đã hát.
-
-    Ranh giới làm tròn theo thời điểm tuyệt đối nên khớp với ass_time(t0) và không lệch tích lũy.
-    """
-    bounds = [int(round(t * 100)) for t in [t0] + list(lit) + [t_end]]
-    parts = ["{\\k%d}" % (bounds[1] - bounds[0])]   # chờ đến khi chấm đầu sáng
-    for j in range(len(lit)):
-        outline_shift = ""
-        if outline_tags:
-            at = (bounds[j + 1] - bounds[0]) * 10
-            outline_shift = "%s\\t(%d,%d,%s)" % (outline_tags[0], at, at + 10, outline_tags[1])
-        parts.append("{\\k%d%s}●%s" % (bounds[j + 2] - bounds[j + 1], outline_shift,
-                                       "  " if j < len(lit) - 1 else ""))
-    return "".join(parts)
-
-_gdi_fonts = {}                     # font -> (hdc, hfont), dùng chung giữa các lần dựng
-_gdi_lock = threading.Lock()
-
-def make_text_measurer(font, size):
-    """Đo độ rộng chữ đậm theo đơn vị PlayRes bằng GDI của Windows; None nếu không đo được.
-
-    Dùng để biết vị trí từng từ trên màn hình khi viền cần đổi màu đúng ranh giới \\kf. lfHeight
-    dương = chiều cao ô chữ, cùng nghĩa với Fontsize của ASS. Đo ở cỡ lớn rồi co lại để hinting
-    không làm tròn độ rộng. GDI không áp kerning như libass nên vài điểm ảnh có thể lệch.
-    """
-    if os.name != "nt":
-        return None
-    ref = 1000
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        gdi32 = ctypes.WinDLL("gdi32")
-
-        class SIZE(ctypes.Structure):
-            _fields_ = [("cx", ctypes.c_long), ("cy", ctypes.c_long)]
-
-        gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
-        gdi32.CreateCompatibleDC.restype = wintypes.HDC
-        gdi32.CreateFontW.argtypes = [ctypes.c_int] * 5 + [wintypes.DWORD] * 8 + [wintypes.LPCWSTR]
-        gdi32.CreateFontW.restype = wintypes.HFONT
-        gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
-        gdi32.SelectObject.restype = wintypes.HGDIOBJ
-        gdi32.GetTextExtentPoint32W.argtypes = [wintypes.HDC, wintypes.LPCWSTR, ctypes.c_int,
-                                                ctypes.POINTER(SIZE)]
-        gdi32.GetTextExtentPoint32W.restype = wintypes.BOOL
-
-        with _gdi_lock:
-            if font not in _gdi_fonts:
-                hdc = gdi32.CreateCompatibleDC(None)
-                hfont = gdi32.CreateFontW(ref, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 0, 0, font)
-                if not hdc or not hfont:
-                    return None
-                gdi32.SelectObject(hdc, hfont)
-                _gdi_fonts[font] = (hdc, hfont)
-            hdc = _gdi_fonts[font][0]
-
-        def measure(text):
-            sz = SIZE()
-            with _gdi_lock:
-                if not gdi32.GetTextExtentPoint32W(hdc, text, len(text), ctypes.byref(sz)):
-                    raise OSError("GetTextExtentPoint32W")
-            return sz.cx * size / ref
-
-        measure("A")    # thử một lần để lỗi lộ ra ở đây chứ không phải giữa lúc dựng
-        return measure
-    except Exception:
-        return None
-
-def line_edges(spans, measure, align, res_x, margin_l, margin_r):
-    """Tọa độ x các ranh giới từ của một câu: edges[k] là mép trái từ k, edges[k+1] là mép phải."""
-    segs = [w + (" " if i < len(spans) - 1 else "") for i, (w, _, _) in enumerate(spans)]
-    total = measure("".join(segs))
-    if align == 1:      # \\an1: căn trái
-        left = margin_l
-    elif align == 3:    # \\an3: căn phải
-        left = res_x - margin_r - total
-    else:               # \\an2: căn giữa giữa hai lề
-        left = margin_l + (res_x - margin_l - margin_r - total) / 2
-    edges, acc = [left], ""
-    for s in segs:
-        acc += s
-        edges.append(left + measure(acc))
-    return edges
-
-def sweep_clip_tags(kind, spans, line_start, edges, pad, height):
-    """Clip chạy cùng đường quét \\kf: phần bên trái ranh giới là chữ đã hát.
-
-    kind = "\\clip" (chỉ giữ phần đã hát) hoặc "\\iclip" (chỉ giữ phần chưa hát); hai lớp dùng cùng
-    ranh giới nên khớp nhau từng điểm ảnh. libass nội suy \\t của clip từ giá trị hiện tại nên chuỗi
-    \\t liên tiếp cộng dồn thành đường chạy liền. pad chừa chỗ cho viền nhô ra ngoài chữ đầu/cuối.
-    Thời gian lấy theo đúng cách karaoke_text chia từ để ranh giới khớp với \\kf.
-    """
-    base = int(round(line_start * 100))
-    pos = base
-    parts = ["%s(0,0,%d,%d)" % (kind, round(edges[0] - pad), height)]
-    for i, (word, t0, t1) in enumerate(spans):
-        a = int(round(t0 * 100))
-        b = int(round(t1 * 100))
-        pos = max(pos, a)
-        dur = max(b - pos, 1)
-        right = edges[i + 1] + (pad if i == len(spans) - 1 else 0)
-        parts.append("\\t(%d,%d,%s(0,0,%d,%d))" % ((pos - base) * 10, (pos + dur - base) * 10,
-                                                   kind, round(right), height))
-        pos += dur
-    return "".join(parts)
-
-def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_IN, gap_long=DEFAULT_GAP_LONG,
-              verse_lead=None, countdown=True, phase_at=None, style=DEFAULT_STYLE, say=log):
-    """verse_lead=None: tự tính = thời gian đếm ngược + thời gian đọc.
-
+    verse_lead=None: tự tính = thời gian đếm ngược + thời gian đọc.
     Mỗi chấm dài số nhịp nguyên nhỏ nhất sao cho >= MIN_DOT_INTERVAL.
     phase_at(t): trả về pha lưới phách của audio quanh t để chấm rơi đúng phách nghe được.
     """
     beat = 60.0 / bpm
-    margin = int(res_y * 0.07)
-    gap = int(size * 1.45)
     dot_beats = min(max(int(np.ceil(MIN_DOT_INTERVAL / beat - 1e-9)), 1), MAX_DOT_BEATS)
     dot_step = dot_beats * beat
     if verse_lead is None:
@@ -446,50 +293,6 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
             verse_lead, COUNTDOWN_BEATS, dot_step, VERSE_READ_TIME))
     elif countdown:
         say("Đếm ngược: mỗi chấm %d nhịp = %.2fs" % (dot_beats, dot_step))
-    dot_size = int(size * 0.7)
-    primary, secondary, outline = (ass_colour(style[k]) for k in ("primary", "secondary", "outline"))
-    outline_w = style["outline_w"] or max(size // 16, 2)
-    outline_sung = ass_colour(style["outline_sung"])
-    outline_w_sung = style["outline_w_sung"] if style["outline_w_sung"] is not None else outline_w
-    # \an của ASS: 1 = dưới-trái, 2 = dưới-giữa, 3 = dưới-phải
-    margin_l, margin_r = style["margin_l"], style["margin_r"]
-    align_top, align_bottom = (1, 3) if style["split_lines"] else (2, 2)
-    outline_tags = None
-    if (outline_sung, outline_w_sung) != (outline, outline_w):
-        outline_tags = ("\\3c%s\\bord%d" % (outline, outline_w),
-                        "\\3c%s\\bord%d" % (outline_sung, outline_w_sung))
-    # viền đổi màu theo đúng đường quét cần biết vị trí từng từ; không đo được thì đổi theo từng ký tự
-    measure = make_text_measurer(font, size) if outline_tags else None
-    if outline_tags and not measure:
-        say("⚠ Không đo được độ rộng chữ, viền sẽ đổi màu theo từng ký tự thay vì theo đường quét")
-    dot_w = max(dot_size // 16, 2)
-    dot_w_sung = dot_w if outline_w_sung == outline_w else max(round(outline_w_sung * dot_size / size), 1)
-    dot_outline_tags = None
-    if outline_tags:
-        dot_outline_tags = ("\\3c%s\\bord%d" % (outline, dot_w), "\\3c%s\\bord%d" % (outline_sung, dot_w_sung))
-
-    header = (
-        "[Script Info]\n"
-        "ScriptType: v4.00+\n"
-        f"PlayResX: {res_x}\n"
-        f"PlayResY: {res_y}\n"
-        "WrapStyle: 2\n"
-        "ScaledBorderAndShadow: yes\n\n"
-        "[V4+ Styles]\n"
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
-        "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
-        "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        # Primary = màu đã hát, Secondary = màu chưa hát
-        f"Style: Bottom,{font},{size},{primary},{secondary},{outline},&H80000000,"
-        f"-1,0,0,0,100,100,0,0,1,{outline_w},1,{align_bottom},{margin_l},{margin_r},{margin},1\n"
-        f"Style: Top,{font},{size},{primary},{secondary},{outline},&H80000000,"
-        f"-1,0,0,0,100,100,0,0,1,{outline_w},1,{align_top},{margin_l},{margin_r},{margin + gap},1\n"
-        # đếm ngược nằm phía trên dòng trên cùng, cùng căn lề với nó
-        f"Style: Count,{font},{dot_size},{primary},{secondary},{outline},&H80000000,"
-        f"-1,0,0,0,100,100,0,0,1,{dot_w},1,{align_top},{margin_l},{margin_r},{margin + 2 * gap},1\n\n"
-        "[Events]\n"
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
-    )
 
     # 1) tính thời điểm hát cho từng câu
     plans = []
@@ -514,7 +317,7 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
             pool = verse_syl[-4:] or all_syl[-4:]
             if pool:   # theo tempo các câu liền trước thay vì chỉ theo BPM
                 syl = max(float(np.median(pool)), MIN_SYLLABLE)
-                say("  ↳ câu cuối đoạn [%s]: theo tempo các câu trước (%.2fs/âm tiết)" % (ass_time(start), syl))
+                say("  ↳ câu cuối đoạn [%s]: theo tempo các câu trước (%.2fs/âm tiết)" % (fmt_time(start), syl))
 
         sing_end, spans, rate = plan_line(start, window, words, syl, tail)
         observed = (sing_end - start) / (n_syl + LAST_WORD_STRETCH - 1)
@@ -550,7 +353,7 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
         slots.append(slot)
         shows.append(min(max(show, 0), start))
 
-    events = []
+    lines, dots = [], []
     for i, (start, sing_end, spans, rate, text) in enumerate(plans):
         show = shows[i]
         hide = sing_end + LINGER
@@ -563,32 +366,15 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
                 break
 
         if rate < SLOW_RATE:
-            fade, speed = (300, 300), "chậm"
+            fade, speed = 0.3, "chậm"
         elif rate > FAST_RATE:
-            fade, speed = (120, 120), "nhanh"
+            fade, speed = 0.12, "nhanh"
         else:
-            fade, speed = (200, 200), "vừa"
+            fade, speed = 0.2, "vừa"
 
-        style_name = "Top" if slots[i] == 0 else "Bottom"
-        fad = "\\fad(%d,%d)" % (fade[0], fade[1])
-        # karaoke_text tự thêm \k chờ từ lúc hiện đến lúc bắt đầu hát
-        if measure:
-            # lớp A: viền chưa hát, chỉ giữ phần phía sau đường quét; lớp B: viền đã hát, chỉ giữ
-            # phần phía trước. \kf không quét được viền nên ranh giới do clip chạy theo.
-            edges = line_edges(spans, measure, align_top if slots[i] == 0 else align_bottom,
-                               res_x, margin_l, margin_r)
-            pad = max(outline_w, outline_w_sung) + 2
-            text = karaoke_text(spans, show)
-            bodies = [
-                "{%s%s}%s" % (fad, sweep_clip_tags("\\iclip", spans, show, edges, pad, res_y), text),
-                "{%s%s%s}%s" % (fad, outline_tags[1], sweep_clip_tags("\\clip", spans, show, edges, pad, res_y), text),
-            ]
-        else:
-            bodies = ["{%s}%s" % (fad, karaoke_text(spans, show, outline_tags))]
-        for body in bodies:
-            events.append("Dialogue: 0,%s,%s,%s,,0,0,0,,%s" % (
-                ass_time(show), ass_time(hide), style_name, body))
-        say("  [%s] %.1f âm tiết/s (%s) %s" % (ass_time(start), rate, speed, text))
+        lines.append({"start": start, "sing_end": sing_end, "spans": spans, "rate": rate, "text": text,
+                      "slot": slots[i], "show": show, "hide": hide, "fade_in": fade, "fade_out": fade})
+        say("  [%s] %.1f âm tiết/s (%s) %s" % (fmt_time(start), rate, speed, text))
 
         is_verse_start = i == 0 or groups[i] != groups[i - 1]   # đầu bài hoặc sau khoảng nghỉ dài
         if countdown and is_verse_start:
@@ -600,14 +386,297 @@ def build_ass(cues, bpm, onsets, font, size, res_x, res_y, lead_in=DEFAULT_LEAD_
             lit = [last - (COUNTDOWN_BEATS - 1 - j) * dot_step for j in range(COUNTDOWN_BEATS)]
             t0 = lit[0] - dot_step
             if t0 >= show:
-                t_end = max(last, start) + COUNTDOWN_HOLD
-                events.append("Dialogue: 1,%s,%s,Count,,0,0,0,,%s" % (
-                    ass_time(t0), ass_time(t_end),
-                    "{\\fad(150,150)}" + countdown_text(t0, lit, t_end, dot_outline_tags)))
+                dots.append({"t0": t0, "lit": lit, "t_end": max(last, start) + COUNTDOWN_HOLD})
             else:
-                say("  ⚠ Đầu đoạn %s hiện trước quá ngắn, bỏ qua đếm ngược" % ass_time(start))
+                say("  ⚠ Đầu đoạn %s hiện trước quá ngắn, bỏ qua đếm ngược" % fmt_time(start))
+    return lines, dots
 
-    return header + "\n".join(events) + "\n"
+# ---------- Render (tự vẽ khung hình bằng Pillow, không qua ASS) ----------
+class FontError(Exception):
+    pass
+
+def find_font_file(family):
+    """Tên font đã cài (vd Arial) hoặc đường dẫn file .ttf/.otf → đường dẫn file font, ưu tiên bản đậm."""
+    family = family.strip()
+    if os.path.isfile(family):
+        return family
+
+    if os.name == "nt":
+        import winreg
+        fonts_dir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+        want = family.lower()
+        regular = bold = None
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                key = winreg.OpenKey(hive, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts")
+            except OSError:
+                continue
+            with key:
+                i = 0
+                while True:
+                    try:
+                        name, value, _ = winreg.EnumValue(key, i)
+                    except OSError:
+                        break
+                    i += 1
+                    if not isinstance(value, str):
+                        continue
+                    face = re.sub(r"\s*\((TrueType|OpenType)\)\s*$", "", name, flags=re.I).strip().lower()
+                    path = value if os.path.isabs(value) else os.path.join(fonts_dir, value)
+                    if face == want + " bold":
+                        bold = bold or path
+                    elif face == want:
+                        regular = regular or path
+        if bold or regular:
+            return bold or regular
+    else:
+        try:   # Linux/macOS: nhờ fontconfig tìm
+            r = subprocess.run(["fc-match", "-f", "%{file}", family + ":bold"],
+                               capture_output=True, text=True, errors="replace")
+            if r.returncode == 0 and os.path.isfile(r.stdout.strip()):
+                return r.stdout.strip()
+        except OSError:
+            pass
+    raise FontError("Không tìm thấy font '%s'. Nhập tên font đã cài (vd Arial) hoặc đường dẫn file .ttf" % family)
+
+def hex_rgb(c):
+    c = c.lstrip("#")
+    return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+
+class KaraokeRenderer:
+    """Vẽ khung hình karaoke. Mỗi câu có hai ảnh cùng kích thước: chưa hát và đã hát (chữ + viền + bóng).
+
+    Mỗi khung hình ghép hai ảnh theo MỘT ranh giới x duy nhất: bên trái lấy ảnh đã hát, bên phải
+    lấy ảnh chưa hát, nên chữ và viền luôn đổi màu cùng một chỗ. Ảnh do Pillow tạo ra đã nhân sẵn
+    alpha (premultiplied) vì Pillow trộn cả bốn kênh khi vẽ chữ trên nền trong suốt.
+    """
+
+    def __init__(self, font, size, res_x, res_y, style):
+        path = find_font_file(font)
+        try:
+            ref = ImageFont.truetype(path, 1000)
+            asc, desc = ref.getmetrics()
+            # Fontsize của ASS là chiều cao ô chữ (ascent + descent), không phải cỡ em của Pillow
+            self.font = ImageFont.truetype(path, max(int(round(size * 1000 / (asc + desc))), 1))
+        except OSError as e:
+            raise FontError("Không mở được font %s: %s" % (path, e))
+        self.ascent, self.descent = self.font.getmetrics()
+        self.size, self.res_x, self.res_y = size, res_x, res_y
+        self.margin = int(res_y * 0.07)
+        self.gap = int(size * 1.45)
+        self.primary, self.secondary = hex_rgb(style["primary"]), hex_rgb(style["secondary"])
+        self.outline, self.outline_sung = hex_rgb(style["outline"]), hex_rgb(style["outline_sung"])
+        ow = style["outline_w"]
+        self.ow = ow if ow is not None else max(size // 16, 2)
+        ow_sung = style["outline_w_sung"]
+        self.ow_sung = ow_sung if ow_sung is not None else self.ow
+        self.margin_l, self.margin_r = style["margin_l"], style["margin_r"]
+        self.align_top, self.align_bottom = (1, 3) if style["split_lines"] else (2, 2)
+        self.shadow = max(1, round(res_y / 1080))
+        # đếm ngược
+        self.dot_size = int(size * 0.7)
+        self.dot_d = max(round(self.dot_size * 0.5), 4)
+        self.dot_w = max(self.dot_size // 16, 2)
+        self.dot_w_sung = (self.dot_w if self.ow_sung == self.ow
+                           else max(round(self.ow_sung * self.dot_size / size), 1))
+        self.dot_pitch = round(self.dot_size * 1.15)
+        self._dots = None
+        self.lines, self.dots, self.cache = [], [], {}
+
+    def set_plan(self, lines, dots):
+        self.lines, self.dots, self.cache = lines, dots, {}
+
+    # ----- ảnh -----
+    def _line_sprite(self, line):
+        words = [unicodedata.normalize("NFC", w) for w, _, _ in line["spans"]]
+        segs = [w + (" " if k < len(words) - 1 else "") for k, w in enumerate(words)]
+        full = "".join(segs)
+        width = self.font.getlength(full)
+        stroke = max(self.ow, self.ow_sung)
+        pad = stroke + self.shadow + 2
+        sw = int(math.ceil(width)) + 2 * pad
+        sh = self.ascent + self.descent + 2 * pad
+
+        def state(fill, outline, w):
+            img = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
+            ImageDraw.Draw(img).text((pad, pad), full, font=self.font, fill=fill + (255,),
+                                     stroke_width=w, stroke_fill=outline + (255,))
+            shade = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
+            ImageDraw.Draw(shade).text((pad + self.shadow, pad + self.shadow), full, font=self.font,
+                                       fill=(0, 0, 0, 128), stroke_width=w, stroke_fill=(0, 0, 0, 128))
+            fg = np.asarray(img).astype(np.uint16)
+            under = np.asarray(shade).astype(np.uint16)
+            out = np.minimum(fg + under * (255 - fg[..., 3:4]) // 255, 255).astype(np.uint8)   # bóng nằm dưới chữ
+            return np.ascontiguousarray(out[..., :3]), np.ascontiguousarray(out[..., 3:4])
+
+        # ranh giới từ theo chính font.getlength nên khớp với cách Pillow đặt chữ; hai đầu nới ra
+        # bằng độ dày viền để quét hết phần viền nhô ra ngoài ký tự đầu/cuối
+        edges, acc = [pad - stroke], ""
+        for s in segs:
+            acc += s
+            edges.append(pad + self.font.getlength(acc))
+        edges[-1] += stroke
+
+        if line["slot"] == 0:
+            align, margin_v = self.align_top, self.margin + self.gap
+        else:
+            align, margin_v = self.align_bottom, self.margin
+        if align == 1:
+            left = self.margin_l
+        elif align == 3:
+            left = self.res_x - self.margin_r - width
+        else:
+            left = self.margin_l + (self.res_x - self.margin_l - self.margin_r - width) / 2
+        return {"unsung": state(self.secondary, self.outline, self.ow),
+                "sung": state(self.primary, self.outline_sung, self.ow_sung),
+                "x0": int(round(left)) - pad,
+                "y0": self.res_y - margin_v - (self.ascent + self.descent) - pad,
+                "w": sw, "edges": edges}
+
+    def _dot_sprites(self):
+        if self._dots is None:
+            ss = 4      # vẽ phóng 4 lần rồi thu nhỏ để mép tròn mịn
+
+            def one(fill, outline, w):
+                s = self.dot_d + 2 * w + 4
+                big = Image.new("RGBA", (s * ss, s * ss), (0, 0, 0, 0))
+                dr = ImageDraw.Draw(big)
+                c = s * ss / 2
+                for r, col in ((self.dot_d / 2 + w, outline), (self.dot_d / 2, fill)):
+                    dr.ellipse([c - r * ss, c - r * ss, c + r * ss, c + r * ss], fill=col + (255,))
+                arr = np.asarray(big.resize((s, s), Image.Resampling.LANCZOS)).astype(np.uint16)   # alpha thẳng
+                a = arr[..., 3:4]
+                return (arr[..., :3] * a // 255).astype(np.uint8), a.astype(np.uint8)
+
+            self._dots = (one(self.secondary, self.outline, self.dot_w),
+                          one(self.primary, self.outline_sung, self.dot_w_sung))
+        return self._dots
+
+    # ----- ghép khung hình -----
+    @staticmethod
+    def _paste(frame, x0, y0, P, A, c0, c1, f256):
+        """Dán cột [c0, c1) của ảnh (P: RGB đã nhân alpha, A: alpha) lên frame, tại (x0, y0)."""
+        fh, fw = frame.shape[:2]
+        fx0, fx1 = max(x0 + c0, 0), min(x0 + c1, fw)
+        fy0, fy1 = max(y0, 0), min(y0 + P.shape[0], fh)
+        if fx0 >= fx1 or fy0 >= fy1:
+            return
+        p = P[fy0 - y0:fy1 - y0, fx0 - x0:fx1 - x0].astype(np.uint16)
+        a = A[fy0 - y0:fy1 - y0, fx0 - x0:fx1 - x0].astype(np.uint16)
+        if f256 < 256:
+            p = p * f256 >> 8
+            a = a * f256 >> 8
+        region = frame[fy0:fy1, fx0:fx1]
+        frame[fy0:fy1, fx0:fx1] = np.minimum(region.astype(np.uint16) * (255 - a) // 255 + p, 255)
+
+    @staticmethod
+    def _fade(t, show, hide, fade_in, fade_out):
+        f = 1.0
+        if fade_in > 0 and t < show + fade_in:
+            f = (t - show) / fade_in
+        if fade_out > 0 and t > hide - fade_out:
+            f = min(f, (hide - t) / fade_out)
+        return int(max(0.0, min(1.0, f)) * 256)
+
+    @staticmethod
+    def _boundary(spans, edges, t, full_w):
+        """x của đường quét tại thời điểm t: bên trái là đã hát."""
+        if t < spans[0][1]:
+            return 0
+        for k, (_, a, b) in enumerate(spans):
+            if t < a:                       # khoảng nghỉ trước từ k: giữ ở cuối từ k-1
+                return edges[k]
+            if t < b:
+                return edges[k] + (edges[k + 1] - edges[k]) * (t - a) / (b - a)
+        return full_w
+
+    def render(self, t, base):
+        """Khung hình tại thời điểm t trên nền base (mảng uint8 H x W x 3; không bị sửa)."""
+        frame = base.copy()
+        for k in [k for k in self.cache if self.lines[k]["hide"] < t - 1.0]:
+            del self.cache[k]       # câu đã ẩn: giải phóng ảnh
+
+        for k, ln in enumerate(self.lines):
+            if not ln["show"] <= t < ln["hide"]:
+                continue
+            if k not in self.cache:
+                self.cache[k] = self._line_sprite(ln)
+            sp = self.cache[k]
+            f256 = self._fade(t, ln["show"], ln["hide"], ln["fade_in"], ln["fade_out"])
+            bx = int(round(self._boundary(ln["spans"], sp["edges"], t, sp["w"])))
+            if bx > 0:
+                self._paste(frame, sp["x0"], sp["y0"], *sp["sung"], 0, min(bx, sp["w"]), f256)
+            if bx < sp["w"]:
+                self._paste(frame, sp["x0"], sp["y0"], *sp["unsung"], max(bx, 0), sp["w"], f256)
+
+        for dg in self.dots:
+            if not dg["t0"] <= t < dg["t_end"]:
+                continue
+            unlit, lit = self._dot_sprites()
+            n = len(dg["lit"])
+            s = unlit[0].shape[0]
+            group_w = (n - 1) * self.dot_pitch + s
+            if self.align_top == 1:
+                left = self.margin_l
+            else:
+                left = self.margin_l + (self.res_x - self.margin_l - self.margin_r - group_w) / 2
+            cy = self.res_y - (self.margin + 2 * self.gap) - round(self.dot_size * 0.55)
+            f256 = self._fade(t, dg["t0"], dg["t_end"], 0.15, 0.15)
+            for j, t_lit in enumerate(dg["lit"]):
+                P, A = lit if t >= t_lit else unlit
+                self._paste(frame, int(round(left)) + j * self.dot_pitch, cy - s // 2, P, A, 0, s, f256)
+        return frame
+
+class Background:
+    """Nền video: màu đặc, ảnh tĩnh (cắt vừa khung) hoặc video lặp vô hạn (ffmpeg đẩy khung RGB qua pipe)."""
+
+    def __init__(self, path, res_x, res_y, stream=True):
+        self.w, self.h = res_x, res_y
+        self.proc = None
+        self.frame = None
+        if not path:
+            rgb = tuple(int(PREVIEW_BG[2:][i:i + 2], 16) for i in (0, 2, 4))
+            self.frame = np.empty((res_y, res_x, 3), np.uint8)
+            self.frame[:] = rgb
+        elif is_video_file(path):
+            self.cmd = ["ffmpeg", "-v", "error", *(["-stream_loop", "-1"] if stream else []), "-i", path, "-an",
+                        "-vf", "fps=%d,scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d" % (
+                            VIDEO_FPS, res_x, res_y, res_x, res_y),
+                        *([] if stream else ["-frames:v", "1"]), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
+            if stream:
+                self.proc = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            else:       # preview: chỉ cần khung đầu
+                r = subprocess.run(self.cmd, capture_output=True,
+                                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                self.frame = self._to_frame(r.stdout)
+                if self.frame is None:
+                    raise OSError("Không đọc được video nền: " + r.stderr.decode("utf-8", "replace")[-200:])
+        else:
+            img = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
+            self.frame = np.asarray(ImageOps.fit(img, (res_x, res_y), Image.Resampling.LANCZOS))
+
+    def _to_frame(self, data):
+        if len(data) < self.w * self.h * 3:
+            return None
+        return np.frombuffer(data, np.uint8, self.w * self.h * 3).reshape(self.h, self.w, 3)
+
+    def next(self):
+        if self.proc is not None:
+            f = self._to_frame(self.proc.stdout.read(self.w * self.h * 3))
+            if f is not None:
+                self.frame = f
+            elif self.frame is None:
+                raise OSError("Không đọc được video nền")
+        return self.frame
+
+    def close(self):
+        if self.proc is not None:
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+            self.proc = None
 
 # ================= UI ACTIONS =================
 def browse_srt():
@@ -657,13 +726,12 @@ def process_queues():
                 preview_dirty = False
                 start_preview()
         elif kind == "done":
-            start_btn.config(state=tk.NORMAL)
             video_btn.config(state=tk.NORMAL)
             stop_btn.config(state=tk.DISABLED)
     root.after(100, process_queues)
 
-def generate_ass(srt_path, audio_path, bpm, snap, font, size, res_x, res_y, countdown, style):
-    """SRT (+ audio) → nội dung ASS. Trả về None nếu không tạo được."""
+def generate_plan(srt_path, audio_path, bpm, snap, countdown):
+    """SRT (+ audio) → (lines, dots) cho bộ vẽ. Trả về None nếu không lập được."""
     cues = parse_srt(srt_path)
     if not cues:
         log("✖ SRT không có câu nào")
@@ -692,8 +760,7 @@ def generate_ass(srt_path, audio_path, bpm, snap, font, size, res_x, res_y, coun
         beat = 60.0 / bpm
         phase_at = lambda t: beat_grid_phase(flux, beat, t)
         log("Canh chấm đếm ngược theo phách của audio")
-    return build_ass(cues, bpm, onsets, font, size, res_x, res_y,
-                     countdown=countdown, phase_at=phase_at, style=style)
+    return plan_karaoke(cues, bpm, onsets, countdown=countdown, phase_at=phase_at)
 
 def read_style():
     """Đọc ở luồng chính; ValueError nếu độ dày viền hoặc lề không phải số nguyên."""
@@ -713,7 +780,7 @@ def pick_color(var, btn):
         btn.config(bg=rgb, activebackground=rgb)
 
 def render_preview(srt_path, cue_no, bpm, font, size, res_x, res_y, style, bg_path=None):
-    """Vẽ một khung hình bằng ffmpeg (libass) rồi báo đường dẫn PNG về luồng chính."""
+    """Vẽ một khung hình (cùng bộ vẽ với video) rồi báo đường dẫn PNG về luồng chính."""
     png = None
     try:
         cues = parse_srt(srt_path) if srt_path else PREVIEW_SAMPLE
@@ -730,30 +797,17 @@ def render_preview(srt_path, cue_no, bpm, font, size, res_x, res_y, style, bg_pa
             dur = min(dur, sub[p + 1][0] - start)
         t = start + 0.5 * dur
 
+        lines, dots = plan_karaoke(sub, bpm or PREVIEW_BPM, None, countdown=False, say=lambda *_: None)
+        renderer = KaraokeRenderer(font, size, res_x, res_y, style)
+        renderer.set_plan(lines, dots)
+        frame = renderer.render(t, Background(bg_path, res_x, res_y, stream=False).next())
+
         work = os.path.join(tempfile.gettempdir(), "karaokeMakerPreview")
         os.makedirs(work, exist_ok=True)
-        with open(os.path.join(work, "preview.ass"), "w", encoding="utf-8") as f:
-            f.write(build_ass(sub, bpm or PREVIEW_BPM, None, font, size, res_x, res_y,
-                              countdown=False, style=style, say=lambda *_: None))
-
-        # setpts đẩy khung hình duy nhất tới thời điểm t để libass vẽ đúng câu đang hát;
-        # settb 1/1000 vì time base mặc định 1/1 làm tròn t xuống giây nguyên
-        if bg_path:
-            src = ["-i", bg_path] if is_video_file(bg_path) else ["-loop", "1", "-framerate", "1", "-i", bg_path]
-            fit = "scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d," % (PREVIEW_SIZE * 2)
-        else:
-            src = ["-f", "lavfi", "-i", "color=c=%s:s=%dx%d:r=1:d=1" % (PREVIEW_BG, *PREVIEW_SIZE)]
-            fit = ""
-        cmd = ["ffmpeg", "-v", "error", "-y", *src,
-               "-vf", "%ssettb=1/1000,setpts=PTS-STARTPTS+%.3f/TB,subtitles=preview.ass" % (fit, t),
-               "-frames:v", "1", "preview.png"]
-        r = subprocess.run(cmd, cwd=work, capture_output=True, text=True, errors="replace",
-                           creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-        if r.returncode != 0:
-            log("✖ Preview lỗi: " + r.stderr.strip()[-300:])
-            return
         png = os.path.join(work, "preview.png")
+        Image.fromarray(frame).resize(PREVIEW_SIZE, Image.Resampling.LANCZOS).save(png)
     except Exception as e:
+        png = None
         log(f"✖ Preview lỗi: {e}")
     finally:
         result_queue.put(("preview", png))
@@ -800,65 +854,59 @@ def audio_duration(path):
     except ValueError:
         return None
 
-def render_video(ass, audio_path, bg_path, out_path, res_x, res_y):
-    """ASS + audio (+ ảnh/video nền) → mp4 bằng ffmpeg; tiến độ chiếm đoạn 60→100%. True nếu thành công.
+def render_video(renderer, audio_path, bg_path, out_path):
+    """Vẽ từng khung hình rồi đẩy vào ffmpeg cùng audio → mp4; tiến độ chiếm đoạn 60→100%.
 
-    Video nền được lặp vô hạn rồi cắt theo độ dài audio (-shortest), tiếng gốc của video bị bỏ.
+    Video nền được lặp vô hạn rồi cắt theo độ dài audio, tiếng gốc của video nền bị bỏ.
+    True nếu thành công.
     """
     global current_process
 
-    work = os.path.join(tempfile.gettempdir(), "karaokeMakerVideo")
-    os.makedirs(work, exist_ok=True)
-    with open(os.path.join(work, "karaoke.ass"), "w", encoding="utf-8") as f:
-        f.write(ass)
-
-    fit = "scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d" % (res_x, res_y, res_x, res_y)
-    if bg_path and is_video_file(bg_path):
-        src = ["-stream_loop", "-1", "-i", bg_path]
-        # fps + PTS-STARTPTS: chuẩn hóa tốc độ khung hình và đưa mốc thời gian về 0 để ASS không bị lệch
-        vf = "fps=%d,setpts=PTS-STARTPTS,%s,subtitles=karaoke.ass" % (VIDEO_FPS, fit)
-    elif bg_path:
-        src = ["-loop", "1", "-framerate", str(VIDEO_FPS), "-i", bg_path]
-        vf = "%s,subtitles=karaoke.ass" % fit
-    else:
-        src = ["-f", "lavfi", "-i", "color=c=%s:s=%dx%d:r=%d" % (PREVIEW_BG, res_x, res_y, VIDEO_FPS)]
-        vf = "subtitles=karaoke.ass"
+    res_x, res_y = renderer.res_x, renderer.res_y
     duration = audio_duration(audio_path)
-    # -shortest một mình để dư đuôi hình 1-2s không có tiếng (nền lặp/vô hạn), nên cắt đúng theo audio
-    limit = ["-t", "%.3f" % duration] if duration else []
-    # subtitles chạy với cwd=work để khỏi phải escape đường dẫn Windows trong filter
-    cmd = ["ffmpeg", "-v", "error", "-y", "-progress", "pipe:1", "-nostats", *src, "-i", audio_path,
-           "-map", "0:v", "-map", "1:a", "-vf", vf,
-           "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
-           "-c:a", "aac", "-b:a", "192k", "-shortest", *limit, "-movflags", "+faststart", out_path]
+    if not duration:
+        duration = max([ln["hide"] for ln in renderer.lines] or [0]) + 2
+    n_frames = int(math.ceil(duration * VIDEO_FPS))
 
-    proc = subprocess.Popen(cmd, cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, errors="replace",
+    cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
+           "-s", "%dx%d" % (res_x, res_y), "-r", str(VIDEO_FPS), "-i", "-", "-i", audio_path,
+           "-map", "0:v", "-map", "1:a", "-t", "%.3f" % duration,
+           "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out_path]
+
+    bg = Background(bg_path, res_x, res_y)
+    err_log = tempfile.TemporaryFile()
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err_log,
                             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
     current_process = proc
-    errors = []
-    for line in proc.stdout:
-        line = line.strip()
-        if line.startswith("out_time_us="):
-            if duration:
-                try:
-                    progress_queue.put(60 + 40 * min(int(line.split("=")[1]) / 1e6 / duration, 1))
-                except ValueError:   # "N/A" lúc mới bắt đầu
-                    pass
-        elif line and not re.match(r"^\w+=", line):
-            errors.append(line)
-    proc.wait()
+    ok = True
+    try:
+        for n in range(n_frames):
+            if not is_running:
+                ok = False
+                break
+            proc.stdin.write(renderer.render(n / VIDEO_FPS, bg.next()).tobytes())
+            if n % 10 == 0:
+                progress_queue.put(60 + 40 * n / n_frames)
+        proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        ok = False      # ffmpeg dừng giữa chừng (lỗi hoặc bị Stop): lý do nằm trong err_log
+    finally:
+        bg.close()
+        proc.wait()
 
     if not is_running:
         if os.path.exists(out_path):
             os.remove(out_path)
         return False
-    if proc.returncode != 0:
-        log("✖ ffmpeg lỗi: " + " | ".join(errors[-3:]))
+    if not ok or proc.returncode != 0:
+        err_log.seek(0)
+        msg = err_log.read().decode("utf-8", "replace").strip().splitlines()
+        log("✖ ffmpeg lỗi: " + " | ".join(msg[-3:]))
         return False
     return True
 
-def start_make(video=False):
+def start_make():
     global is_running
 
     if is_running:
@@ -869,7 +917,7 @@ def start_make(video=False):
     if not srt_path:
         messagebox.showerror("Error", "Chưa chọn file SRT")
         return
-    if video and not audio_path:
+    if not audio_path:
         messagebox.showerror("Error", "Cần chọn file audio để tạo video")
         return
 
@@ -890,23 +938,24 @@ def start_make(video=False):
         return
 
     font = font_var.get().strip() or "Arial"
-    snap = bool(audio_path)
+    try:
+        find_font_file(font)    # báo lỗi font ngay thay vì sau khi đã phân tích audio
+    except FontError as e:
+        messagebox.showerror("Error", str(e))
+        return
     countdown = countdown_var.get()   # đọc ở luồng chính, luồng nền không được đụng biến Tk
     res_x = res_y * 16 // 9
 
-    ext = ".mp4" if video else ".ass"
     out_path = filedialog.asksaveasfilename(
-        title="Lưu video" if video else "Lưu file ASS", defaultextension=ext,
-        initialdir=os.path.dirname(srt_path),
-        initialfile=os.path.splitext(os.path.basename(srt_path))[0] + ext,
-        filetypes=[("MP4 files", "*.mp4")] if video else [("ASS files", "*.ass")])
+        title="Lưu video", defaultextension=".mp4", initialdir=os.path.dirname(srt_path),
+        initialfile=os.path.splitext(os.path.basename(srt_path))[0] + ".mp4",
+        filetypes=[("MP4 files", "*.mp4")])
     if not out_path:
         return
     bg_path = bg_var.get()
 
     progress_var.set(0)
     is_running = True
-    start_btn.config(state=tk.DISABLED)
     video_btn.config(state=tk.DISABLED)
     stop_btn.config(state=tk.NORMAL)
 
@@ -917,16 +966,13 @@ def start_make(video=False):
         log(f"\n--- Đang tạo karaoke: {name} ---")
 
         try:
-            ass = generate_ass(srt_path, audio_path, bpm, snap, font, size, res_x, res_y,
-                              countdown, style)
-            if ass and video:
+            plan = generate_plan(srt_path, audio_path, bpm, bool(audio_path), countdown)
+            if plan and is_running:
+                renderer = KaraokeRenderer(font, size, res_x, res_y, style)
+                renderer.set_plan(*plan)
                 log("Đang render video...")
-                if render_video(ass, audio_path, bg_path, out_path, res_x, res_y):
+                if render_video(renderer, audio_path, bg_path, out_path):
                     log(f"✔ Đã tạo video: {out_path}")
-            elif ass:
-                with open(out_path, "w", encoding="utf-8") as f:
-                    f.write(ass)
-                log(f"✔ Đã lưu: {out_path}")
         except Exception as e:
             log(f"Error: {str(e)}")
 
@@ -956,12 +1002,14 @@ def stop_make():
 # ================= UI =================
 if __name__ == "__main__":
     root = tk.Tk()
-    root.title("Karaoke Maker (SRT → ASS)")
+    root.title("Karaoke Maker (SRT → Video)")
     root.geometry("1180x640")
 
-    if np is None:
+    missing = [name for name, mod in (("numpy", np), ("pillow", Image)) if mod is None]
+    if missing:
         root.withdraw()
-        messagebox.showerror("Error", "Thiếu thư viện numpy.\nCài bằng: pip install numpy")
+        messagebox.showerror("Error", "Thiếu thư viện: %s.\nCài bằng: pip install %s" % (
+            ", ".join(missing), " ".join(missing)))
         sys.exit(1)
 
     frame = ttk.Frame(root, padding=10)
@@ -1010,7 +1058,7 @@ if __name__ == "__main__":
     ttk.Label(opt_frame, text="BPM:").grid(row=0, column=0, sticky="w", padx=5)
     ttk.Entry(opt_frame, textvariable=bpm_var, width=10).grid(row=0, column=1, padx=5)
 
-    ttk.Label(opt_frame, text="Font:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+    ttk.Label(opt_frame, text="Font (tên hoặc file):").grid(row=1, column=0, sticky="w", padx=5, pady=5)
     ttk.Entry(opt_frame, textvariable=font_var, width=16).grid(row=1, column=1, padx=5)
     ttk.Label(opt_frame, text="Cỡ chữ:").grid(row=1, column=2, sticky="w", padx=5)
     ttk.Spinbox(opt_frame, from_=16, to=200, textvariable=size_var, width=8).grid(row=1, column=3, padx=5)
@@ -1081,10 +1129,7 @@ if __name__ == "__main__":
     btn_frame = ttk.Frame(left)
     btn_frame.pack(fill=tk.X, pady=10)
 
-    start_btn = ttk.Button(btn_frame, text="▶ Create ASS", command=start_make)
-    start_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
-
-    video_btn = ttk.Button(btn_frame, text="🎬 Create Video", command=lambda: start_make(video=True))
+    video_btn = ttk.Button(btn_frame, text="🎬 Create Video", command=start_make)
     video_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
 
     stop_btn = ttk.Button(btn_frame, text="■ Stop", command=stop_make, state=tk.DISABLED)
